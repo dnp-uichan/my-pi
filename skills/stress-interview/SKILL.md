@@ -1,10 +1,12 @@
 ---
 name: stress-interview
 description: "변경사항을 여러 관점에서 검증·리뷰할 때 사용한다."
-disable-model-invocation: false
+disable-model-invocation: true
 ---
 
 # stress-interview
+
+사용자가 이 절차를 명시 요청했거나 명시 선택한 상위 워크플로의 하위 단계일 때만 수행한다. 일반 리뷰 요청이나 다른 검증의 완료만으로 자동 진입하지 않는다.
 
 `$ARGUMENTS`에 대해 **`verifier` + `reviewer` + `challenger`를 병렬 호출**해 교차 검토한다.
 

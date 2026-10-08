@@ -1,10 +1,12 @@
 ---
 name: self-healing
 description: "변경사항을 자동으로 리뷰·수정·재검토하는 self-healing 요청에 사용한다."
-disable-model-invocation: false
+disable-model-invocation: true
 ---
 
 # self-healing
+
+사용자가 이 수정 루프를 명시 요청했거나 명시 선택한 상위 워크플로의 하위 단계일 때만 수행한다. 검증 실패만으로 이 전체 루프를 자동 시작하지 않는다.
 
 `$ARGUMENTS`에 대해 아래 루프를 수행한다:
 
