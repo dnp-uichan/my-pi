@@ -2,7 +2,6 @@
 name: security-auditor
 description: Security vulnerability analyst — use for focused security review of code changes with high-confidence findings only
 tools: read, grep, find, ls, bash
-model: anthropic/claude-opus-5
 thinking: high
 ---
 

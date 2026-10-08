@@ -2,7 +2,6 @@
 name: reviewer
 description: Code review specialist — use for quality, correctness, and security analysis of code changes
 tools: read, grep, find, ls, bash
-model: anthropic/claude-opus-5
 thinking: high
 ---
 

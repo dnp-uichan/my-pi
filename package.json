@@ -1,7 +1,7 @@
 {
 	"name": "@jonghakseo/my-pi",
 	"version": "0.1.1",
-	"description": "A personal AI operating system built on pi — 8 agents, local/npm extensions, 8 themes",
+	"description": "A personal AI operating system built on pi — 10 agents, local/npm extensions, 8 themes",
 	"keywords": [
 		"pi-package"
 	],
@@ -22,10 +22,11 @@
 		"extensions/footer/",
 		"extensions/fork-panel/",
 		"extensions/github-pr-merge/",
+		"extensions/interactive-shell/",
 		"extensions/notify/",
+		"extensions/ollama-kimi-k2-6-cloud/",
 		"extensions/package.json",
-		"extensions/pnpm-lock.yaml",
-		"extensions/pnpm-workspace.yaml",
+		"extensions/bun.lock",
 		"extensions/pr-comments/",
 		"extensions/pr-review-re-request/",
 		"extensions/prompt-suggest-lite/",
@@ -36,6 +37,7 @@
 		"extensions/tool-group-renderer/",
 		"extensions/tooling/",
 		"extensions/tsconfig.json",
+		"extensions/upload-image-url/",
 		"extensions/usage-analytics/",
 		"extensions/utils/",
 		"extensions/working-text/",
@@ -43,16 +45,8 @@
 		"!extensions/**/.env",
 		"!extensions/prompt-suggest-lite/.data/",
 		"!extensions/utils/coverage/",
-		"skills/context7-cli/",
-		"skills/design-first/",
-		"skills/dynamic-workflow/",
-		"skills/memory-manage/",
-		"skills/pi-auto-update/",
-		"skills/self-healing/",
-		"skills/ship/",
-		"skills/stress-interview/",
-		"skills/systematic-debugging/",
-		"skills/usage-analytics/",
+		"skills/",
+		".mise.toml",
 		"themes/",
 		"scripts/sync-agents.mjs",
 		"scripts/validate-packlist.mjs",
@@ -72,7 +66,8 @@
 	"scripts": {
 		"sync-agents": "node scripts/sync-agents.mjs",
 		"validate:packlist": "node scripts/validate-packlist.mjs",
-		"prepublishOnly": "pnpm run validate:packlist",
+		"prepublishOnly": "bun run validate:packlist",
+		"test:sync-agents": "node --test scripts/sync-agents.test.mjs",
 		"postinstall": "node scripts/sync-agents.mjs"
 	},
 	"pi": {
@@ -92,7 +87,7 @@
 	"peerDependencies": {
 		"@earendil-works/pi-coding-agent": "*",
 		"@earendil-works/pi-tui": "*",
-		"@sinclair/typebox": "*"
+		"typebox": "*"
 	},
-	"packageManager": "pnpm@10.24.0+sha512.01ff8ae71b4419903b65c60fb2dc9d34cf8bb6e06d03bde112ef38f7a34d6904c424ba66bea5cdcf12890230bf39f9580473140ed9c946fef328b6e5238a345a"
+	"packageManager": "bun@1.3.11"
 }

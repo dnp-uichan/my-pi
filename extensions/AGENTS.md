@@ -28,7 +28,7 @@ Custom extensions for the pi coding agent. All extensions are written in TypeScr
 - **`bash`**: synchronous commands. A successful result still means the command finished.
 - **`bash_async`**: finite, non-interactive work that can complete later. Use `start`, then rely on the completion follow-up rather than repeated polling. It does not support stdin, REPLs, or TUIs. Closed logs normally retain their paths for 24 hours, but the shared log root prunes its oldest closed logs early once it exceeds 1 GiB. Active and unmarked logs are preserved; concurrently running managers enforce this quota best-effort rather than atomically.
 - **`tmux-terminal` skill/helper**: use only for TUI, REPL, stdin, and selection-menu interaction that needs a PTY. Run the helper through short synchronous `bash` calls.
-- The native interactive-shell overlay, `interactive_shell` tool, `/attach`, `/dismiss`, widgets, and reattach UI are removed intentionally.
+- This personal fork retains the native `interactive-shell` overlay and `interactive_shell` tool for delegating to interactive coding agents. Use `bash` for ordinary commands. The obsolete `interactive-shell` skill remains removed; do not restore its conflicting routing instructions.
 
 ## Key Patterns
 - **Extension entry point**: Pi auto-discovers both root `*.ts` files and `directory/index.ts` files, but this repo standardizes on `extensions/<name>/index.ts` only to avoid duplicate loading.
@@ -37,15 +37,15 @@ Custom extensions for the pi coding agent. All extensions are written in TypeScr
 - **Themes**: `theme-cycler/index.ts` provides runtime theme switching.
 
 ## Tooling Standards
-- **Package manager**: pnpm
+- **Package manager**: Bun 1.3.11 (Node 22.19.0 and Bun are pinned in `.mise.toml`).
 - **Test colocation**: Keep each test in the directory of the module it primarily exercises; keep shared utility tests in `utils/`.
 - **Quality checks**:
-  - `pnpm run typecheck` — TypeScript 타입 검사 (오류만 출력, 파일 변경 없음)
-  - `pnpm test` — `tooling/vitest.config.ts` 기준으로 `extensions/**/*.test.ts` 전체 실행 (`tooling/`에 두어 Pi auto-discovery를 피함)
-  - `pnpm run lint` — Biome lint + **자동 수정** (`biome check --write .`). 파일을 직접 고침.
-  - `pnpm run format` — Biome 포맷 검사만 (파일 변경 없음)
-  - `pnpm run format:write` — Biome 포맷 자동 적용 (파일 변경 있음)
-  > **주의:** `pnpm run lint`는 `--write` 옵션으로 실행되므로 파일이 즉시 수정된다. 검사만 원하면 `biome check .`를 직접 실행할 것.
+  - `bun run typecheck` — TypeScript 타입 검사 (오류만 출력, 파일 변경 없음)
+  - `bun run test` — `tooling/vitest.config.ts` 기준으로 `extensions/**/*.test.ts` 전체 실행 (`tooling/`에 두어 Pi auto-discovery를 피함)
+  - `bun run lint` — Biome lint + **자동 수정** (`biome check --write .`). 파일을 직접 고침.
+  - `bun run format` — Biome 포맷 검사만 (파일 변경 없음)
+  - `bun run format:write` — Biome 포맷 자동 적용 (파일 변경 있음)
+  > **주의:** `bun run lint`는 `--write` 옵션으로 실행되므로 파일이 즉시 수정된다. 검사만 원하면 `bunx --no-install biome check .`를 직접 실행할 것.
 - **Formatter**: Biome 2.x
 
 ## Type Contract Guide

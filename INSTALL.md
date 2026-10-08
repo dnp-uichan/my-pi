@@ -1,9 +1,10 @@
 # Installation
 
-This guide reproduces the **`Jonghakseo/my-pi`** environment on a fresh macOS machine.
-After completing it, you should have the same `pi` TUI, the same 8 agents, all
-remote-tracked skills, the local extension workspace, and the MCP bridge wired into
-Claude Code.
+This guide documents the local Bun/mise fork of **`Jonghakseo/my-pi`**.
+The prepared checkout supplies 10 bundled agents, local/npm resources, and the
+existing Claude MCP bridge without replacing personal configuration.
+The current local update has not been pushed; cloning upstream alone does not
+reproduce these personal changes.
 
 > Linux works too if you skip macOS-specific items (Ghostty, AppleScript-based skills,
 > Peekaboo). Windows is not supported.
@@ -12,14 +13,14 @@ Claude Code.
 
 ## 1. Prerequisites
 
-Install these **before** cloning. Versions below are what the repo is developed against.
+Install these **before** bootstrap. Versions below are what the repo is developed against.
 
 ### Runtimes
 
 | Tool | Version | Install |
 |---|---|---|
 | **Node.js** | `>=22.19` (tested on `22.19.0`) | `brew install node@22` or `mise use -g node@22` |
-| **pnpm** | `>=10.24` (pinned via `packageManager`) | `corepack enable && corepack prepare pnpm@10.24.0 --activate` |
+| **Bun** | `1.3.11` (pinned via `.mise.toml` and `packageManager`) | `mise install` |
 | **Python** | `>=3.10` | for the `skill-creator` skill's `validate_skill.py` (`@ryan_nookpi/pi-skill-skill-creator`) |
 | **Git** | any recent | `brew install git` |
 
@@ -50,17 +51,19 @@ Skip any you don't use; the matching skill will simply no-op.
 
 ---
 
-## 2. Clone into the canonical path
+## 2. Choose the installation layout
 
-pi reads its configuration from **`~/.pi/agent`**. The repo must live there.
+pi reads its configuration from **`~/.pi/agent`**. The source may live in a separate checkout with resource links into that directory. For an existing installation, preserve auth, MCP, memory, personal settings and agents; do not replace them with the repository templates. Remove old local extension links when the same extension is supplied by npm, so it loads only once.
+
+The validated local checkout is:
 
 ```bash
-# Back up an existing setup first if you have one.
-mv ~/.pi/agent ~/.pi/agent.bak.$(date +%s) 2>/dev/null || true
-
-git clone https://github.com/Jonghakseo/my-pi.git ~/.pi/agent
-cd ~/.pi/agent
+cd ~/Desktop/my-pi
 ```
+
+Its branch is `chore/upstream-20261007`. This is now an independent repository: its Git metadata, current source, and retained `interactive-shell` tool all live inside `~/Desktop/my-pi`. No second worktree is required. The original working states are backed up outside the active installation. Only the obsolete `interactive-shell` skill was removed. The new `output-compactor` extension is not linked into the active installation, so this update does not enable its automatic model calls.
+
+For another machine, first obtain the intended personal fork revision and establish the resource links deliberately. Do not move or replace an existing `~/.pi/agent` as an installation shortcut.
 
 ---
 
@@ -74,13 +77,13 @@ The script checks required CLI availability, installs dependencies, syncs agents
 
 It will:
 
-1. Check that Node, pnpm, Git, GitHub CLI, and pi are available.
-2. `pnpm install` at the repo root **and** inside `extensions/`.
-3. Run `scripts/sync-agents.mjs` to sync `agents/*.md` into `~/.pi/agent/agents/` and remove retired bundled agent definitions.
+1. Check that Node, Bun, Git, GitHub CLI, and pi are available.
+2. Run `bun install --omit peer` at the repo root and `bun install` inside `extensions/`.
+3. Run `scripts/sync-agents.mjs` to sync `agents/*.md` into `~/.pi/agent/agents/` and remove retired bundled agent definitions. Existing user model assignments and unrelated personal agents are preserved, including on `--force`. `PI_CODING_AGENT_DIR` can point to an isolated validation directory.
 4. Create `.env` from the template if missing.
 5. Print a checklist of any missing optional CLIs from §1.
 
-Re-run it anytime; it is idempotent.
+Re-run it anytime; it is idempotent. Bundled agents ship without `model:`. Configure models manually in the installed agent definitions after validation; unspecified models follow runtime defaults.
 
 ---
 
@@ -100,9 +103,11 @@ Only needed if you use the `browser` agent with persistent cookies.
 
 ---
 
-## 5. MCP servers (built-in)
+## 5. MCP servers
 
-pi ships built-in MCP support (`builtin:mcp`). Servers live in
+This local installation retains its existing Claude MCP bridge and configuration. A native MCP migration is separate work; do not expose the same servers through both mechanisms unintentionally.
+
+For a new native-only setup, pi ships built-in MCP support (`builtin:mcp`). Servers live in
 `~/.pi/agent/mcp.json` (global) or `.pi/mcp.json` (trusted projects), and tools
 are exposed as `mcp__<server>__<tool>`.
 
@@ -120,7 +125,7 @@ cd ~/.pi/agent
 pi
 ```
 
-First launch will prompt you to sign in to the default provider
+Existing installations keep their authentication. A fresh installation will prompt you to sign in to the default provider
 (`openai-codex` per `settings.json`). After that the TUI should look identical to
 the screenshot in the [README](./README.md#usage-example).
 
@@ -149,10 +154,8 @@ in git. Cloning gives you exactly the public skill set — no extra steps.
 
 - **`pi` not found** → re-run `npm i -g @earendil-works/pi-coding-agent` and
   check `npm bin -g` is on your `PATH`.
-- **`pnpm install` fails on `peerDependencies`** → make sure the global `pi`
-  package is installed first; the root `package.json` declares
-  `@earendil-works/pi-coding-agent` as a peer.
+- **Dependency installation fails** → use the pinned Bun version. Root installation uses `bun install --omit peer`; extension development dependencies are pinned to the installed Pi release.
 - **Agents missing in TUI** → run `node scripts/sync-agents.mjs --force`.
 - **MCP tools missing** → run `pi mcp list` and fix the failing entry in
   `mcp.json`, or `/mcp reconnect <server>` inside a session.
-- **`extensions/` typecheck errors** → `cd extensions && pnpm typecheck`.
+- **`extensions/` typecheck errors** → `cd extensions && bun run typecheck`.

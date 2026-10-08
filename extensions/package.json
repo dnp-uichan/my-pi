@@ -3,12 +3,14 @@
 	"license": "MIT",
 	"private": true,
 	"type": "module",
-	"packageManager": "pnpm@10.24.0",
-	"pnpm": {
-		"overrides": {
-			"@earendil-works/pi-ai": "1.0.4"
-		}
+	"packageManager": "bun@1.3.11",
+	"overrides": {
+		"@earendil-works/pi-ai": "1.0.4"
 	},
+	"trustedDependencies": [
+		"esbuild",
+		"node-pty"
+	],
 	"scripts": {
 		"check": "biome check .",
 		"typecheck": "tsc -p tsconfig.json --noEmit",
@@ -33,7 +35,10 @@
 		"vitest": "^4.0.18"
 	},
 	"dependencies": {
+		"@xterm/addon-serialize": "0.13.0",
+		"@xterm/headless": "5.5.0",
 		"diff": "^8.0.4",
-		"file-type": "^21.3.0"
+		"file-type": "^21.3.0",
+		"node-pty": "1.1.0"
 	}
 }

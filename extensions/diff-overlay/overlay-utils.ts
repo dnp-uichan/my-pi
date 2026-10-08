@@ -230,7 +230,7 @@ function isCommitFileMarkerLine(line: string): boolean {
 }
 
 function shouldHideCommitParsedLine(line: ReturnType<typeof parseDiffLines>[number] | undefined): boolean {
-	if (!line || line.category !== "meta") return false;
+	if (line?.category !== "meta") return false;
 	return line.originalLine.startsWith("diff ") || isCommitFileMarkerLine(line.originalLine);
 }
 
@@ -280,7 +280,7 @@ export function buildCommitRenderedDiffLines(
 }
 
 function shouldHideDiffMetaLine(line: ReturnType<typeof parseDiffLines>[number] | undefined): boolean {
-	if (!line || line.category !== "meta") return false;
+	if (line?.category !== "meta") return false;
 	return !line.originalLine.startsWith("\\");
 }
 

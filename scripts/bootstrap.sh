@@ -38,7 +38,7 @@ require() {
 
 MISSING=0
 require node "node -v"  ">=22.19"
-require pnpm "pnpm -v"  ">=10.24"
+require bun  "bun -v"   ">=1.3.11"
 require git  "git --version | awk '{print \$3}'" "any"
 require gh   "gh --version | head -n1 | awk '{print \$3}'" "any"
 
@@ -66,12 +66,12 @@ if [[ "$MISSING" == "1" ]]; then
 fi
 
 # 3. Install dependencies -----------------------------------------------------
-bold "==> Installing root dependencies (pnpm install)"
-(cd "$REPO_ROOT" && pnpm install)
+bold "==> Installing root dependencies (bun install)"
+(cd "$REPO_ROOT" && bun install --omit peer)
 
 if [[ -f "$REPO_ROOT/extensions/package.json" ]]; then
   bold "==> Installing extensions workspace"
-  (cd "$REPO_ROOT/extensions" && pnpm install)
+  (cd "$REPO_ROOT/extensions" && bun install)
 fi
 
 # 4. Sync agents into ~/.pi/agent/agents -------------------------------------

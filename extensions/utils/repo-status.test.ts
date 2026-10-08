@@ -65,33 +65,36 @@ describe("createRepoStatusTracker", () => {
 		["APPROVED", [{ author: { login: "alice" }, state: "APPROVED" }], [{ login: "bob" }], "review"],
 		["REVIEW_REQUIRED", [{ author: { login: "alice" }, state: "COMMENTED" }], [{ login: "bob" }], "review"],
 		["CHANGES_REQUESTED", [{ author: { login: "alice" }, state: "PENDING" }], [], "review"],
-	] as const)("maps PR review status to %s / %s / %s", async (reviewDecision, latestReviews, reviewRequests, expectedState) => {
-		const exec = vi
-			.fn()
-			.mockResolvedValueOnce({
-				code: 0,
-				stdout: ["# branch.oid 89abcdef01234567", "# branch.head feature"].join("\n"),
-			})
-			.mockResolvedValueOnce({
-				code: 0,
-				stdout: JSON.stringify({
-					number: 42,
-					title: "Feature PR",
-					state: "OPEN",
-					reviewDecision,
-					latestReviews,
-					reviewRequests,
-				}),
-			});
-		const pi = { exec } as unknown as ExtensionAPI;
-		const tracker = createRepoStatusTracker(pi, "/tmp/repo");
+	] as const)(
+		"maps PR review status to %s / %s / %s",
+		async (reviewDecision, latestReviews, reviewRequests, expectedState) => {
+			const exec = vi
+				.fn()
+				.mockResolvedValueOnce({
+					code: 0,
+					stdout: ["# branch.oid 89abcdef01234567", "# branch.head feature"].join("\n"),
+				})
+				.mockResolvedValueOnce({
+					code: 0,
+					stdout: JSON.stringify({
+						number: 42,
+						title: "Feature PR",
+						state: "OPEN",
+						reviewDecision,
+						latestReviews,
+						reviewRequests,
+					}),
+				});
+			const pi = { exec } as unknown as ExtensionAPI;
+			const tracker = createRepoStatusTracker(pi, "/tmp/repo");
 
-		await flushAsyncWork();
+			await flushAsyncWork();
 
-		expect(tracker.getSnapshot().review).toEqual({ state: expectedState });
+			expect(tracker.getSnapshot().review).toEqual({ state: expectedState });
 
-		tracker.dispose();
-	});
+			tracker.dispose();
+		},
+	);
 
 	it.each(["CLOSED", "MERGED"])("hides PR metadata when gh pr view reports %s", async (state) => {
 		const exec = vi

@@ -87,6 +87,20 @@
 	},
 	"overrides": [
 		{
+			"includes": [
+				"interactive-shell/key-encoding.ts",
+				"interactive-shell/pty-protocol.ts",
+				"interactive-shell/pty-session.ts"
+			],
+			"linter": {
+				"rules": {
+					"suspicious": {
+						"noControlCharactersInRegex": "off"
+					}
+				}
+			}
+		},
+		{
 			"includes": ["**/*.test.ts", "**/*.spec.ts"],
 			"linter": {
 				"rules": {

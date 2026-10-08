@@ -8,7 +8,7 @@
  *
  * Default behavior: run at most once per package version by writing a stamp
  * file under ~/.pi/agent/state/. Use --force to bypass the stamp and overwrite
- * existing files.
+ * existing role instructions while preserving user model assignments.
  *
  * Usage:
  *   node scripts/sync-agents.mjs          # normal run (once per version)
@@ -25,13 +25,15 @@ const __dirname = path.dirname(__filename);
 
 const repoRoot = path.resolve(__dirname, "..");
 const sourceDir = path.join(repoRoot, "agents");
-const agentRootDir = path.join(os.homedir(), ".pi", "agent");
+const agentRootDir = process.env.PI_CODING_AGENT_DIR
+  ? path.resolve(process.env.PI_CODING_AGENT_DIR)
+  : path.join(os.homedir(), ".pi", "agent");
 const targetDir = path.join(agentRootDir, "agents");
 const stateDir = path.join(agentRootDir, "state");
 const stampFile = path.join(stateDir, "sync-agents.json");
 const packageJsonPath = path.join(repoRoot, "package.json");
 const forceOverwrite = process.argv.includes("--force");
-const retiredAgentFiles = ["deepseek-worker.md", "simplifier.md"];
+const retiredAgentFiles = ["deepseek-worker.md", "finder.md", "planner.md"];
 
 function readPackageVersion() {
   try {
@@ -85,8 +87,18 @@ function removeRetiredAgents() {
   }
 }
 
+function preserveModelAssignment(source, existing) {
+  const frontmatter = existing.match(/^---\r?\n([\s\S]*?)\r?\n---/);
+  const model = frontmatter?.[1].match(/^model:[^\r\n]*$/m)?.[0];
+  if (!model) return source;
+  return source.replace(/^---\r?\n([\s\S]*?)\r?\n---/, (_match, body) => {
+    const withoutModel = body.replace(/^model:[^\r\n]*\r?\n?/gm, "").trimEnd();
+    return `---\n${withoutModel}\n${model}\n---`;
+  });
+}
+
 function main() {
-  // Bail out gracefully if source dir doesn't exist (e.g. partial clone)
+  /* Bail out gracefully if source dir does not exist. */
   if (!fs.existsSync(sourceDir)) {
     console.log(`[sync-agents] Source directory not found: ${sourceDir}`);
     console.log("[sync-agents] Skipping agent sync.");
@@ -111,7 +123,7 @@ function main() {
     return;
   }
 
-  // Ensure target directory exists
+  /* Ensure target directory exists. */
   fs.mkdirSync(targetDir, { recursive: true });
 
   let copied = 0;
@@ -122,11 +134,20 @@ function main() {
     const dst = path.join(targetDir, file);
     const existedBefore = fs.existsSync(dst);
 
-    if (existedBefore && !forceOverwrite) {
+    if (existedBefore && fs.realpathSync(src) === fs.realpathSync(dst)) {
+      console.log(`  skipped  ${file}  (source and target are identical)`);
+      skipped++;
+    } else if (existedBefore && !forceOverwrite) {
       console.log(`  skipped  ${file}  (already exists)`);
       skipped++;
     } else {
-      fs.copyFileSync(src, dst);
+      const source = fs.readFileSync(src, "utf8");
+      const content = existedBefore
+        ? preserveModelAssignment(source, fs.readFileSync(dst, "utf8"))
+        : source;
+      /* Never overwrite the external source of an existing symlink. */
+      if (fs.lstatSync(dst, { throwIfNoEntry: false })?.isSymbolicLink()) fs.unlinkSync(dst);
+      fs.writeFileSync(dst, content);
       const label = existedBefore ? "overwrote " : "copied    ";
       console.log(`  ${label}${file}`);
       copied++;
