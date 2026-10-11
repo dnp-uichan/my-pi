@@ -30,6 +30,7 @@ Pi 공식 문서는 auto-discovery 대상으로 `extensions/*.ts`와 `extensions
 | [`theme-cycler/`](./theme-cycler/index.ts) | `Ctrl+Shift+X`로 테마 순환 |
 | [`usage-analytics/`](./usage-analytics/index.ts) | 서브에이전트·스킬 사용 통계 오버레이 |
 | [`working-text/`](./working-text/index.ts) | 스피너 작업 메시지 (팁 텍스트 + 경과 시간) |
+| [`workflow-controller/`](./workflow-controller/README.md) | `/workflow` 승인·검사·독립 검수·중단/복구·commit/Draft PR 전달 관리 |
 
 ## 기술 스택
 

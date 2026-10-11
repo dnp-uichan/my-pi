@@ -41,6 +41,7 @@
 		"extensions/usage-analytics/",
 		"extensions/utils/",
 		"extensions/working-text/",
+		"extensions/workflow-controller/",
 		"extensions/worktree/",
 		"!extensions/**/.env",
 		"!extensions/prompt-suggest-lite/.data/",
