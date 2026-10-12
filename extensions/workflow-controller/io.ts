@@ -186,6 +186,12 @@ export async function load(agentDir: string, repoKey: string, workflowId: string
 		}
 		if (["reviewing", "ready-to-deliver"].includes(data.phase)) data.phase = "executing";
 	}
+	/* 출처 없는 과거 중단 기록은 사용자 보류로 다룬다. running은 세션 복원에서 시스템 중단을 관찰한다. */
+	if (data.controlSource === undefined) {
+		data.controlSource = data.control === "running" ? "system" : "user";
+		data.userHold = data.control !== "running";
+	}
+	data.controlRevision ??= 0;
 	return data;
 }
 const choices = (values: string[]) => Type.Union(values.map((value) => Type.Literal(value)));
@@ -232,6 +238,9 @@ const singleSchema = Type.Object({
 	phase: choices(["drafting", "awaiting-approval", "executing", "reviewing", "ready-to-deliver", "completed"]),
 	control: choices(["running", "stopping", "paused", "blocked", "cancelled"]),
 	stopTarget: Type.Optional(choices(["paused", "cancelled"])),
+	controlSource: Type.Optional(choices(["user", "orchestrator", "system"])),
+	userHold: Type.Optional(Type.Boolean()),
+	controlRevision: Type.Optional(count),
 	reason: Type.Optional(text),
 	spec: Type.Optional(
 		Type.Object({
@@ -412,6 +421,10 @@ function validWorkflow(value: unknown): value is Workflow {
 		new Set(state.attempts.map((a) => a.id)).size === state.attempts.length &&
 		state.attempts.every((a) => a.generation <= state.owner.generation);
 	return (
+		/* 부분적으로 쓰인 권한 필드도 모호한 정본이므로 거절한다. */
+		(state.controlSource === undefined
+			? state.userHold === undefined && state.controlRevision === undefined
+			: typeof state.userHold === "boolean" && state.controlRevision !== undefined) &&
 		validStack(state) &&
 		spec &&
 		approval &&

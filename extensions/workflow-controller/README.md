@@ -2,7 +2,7 @@
 
 Pi 메인이 판단과 분담을 맡고, 이 확장은 승인·상태·검사 증거·독립 검수·중단·전달 조건을 관리한다. subagent 관리 API v1이 없으면 시작하지 않는다.
 
-- `/workflow start <목표>`로 읽기 전용 조사와 계획 제안을 시작한다.
+- 메인이 `workflow_start({ goal: "목표" })`로 읽기 전용 조사와 계획 제안을 시작한다. 사용자가 `/workflow start <목표>`로 직접 시작할 수도 있다.
 - `workflow_propose`의 실제 UI에서 `승인`을 선택하거나 `/workflow approve`로 승인한다. 모델의 텍스트·도구 인자는 승인이 아니다. `endpoint: "pr"`일 때만 선택 필드 `prBase`를 지정할 수 있으며 생략하면 `stage`다. stacked PR이면 보호 브랜치(`main`, `master`, `stage`, `development`, `production`)가 아닌 기존 원격 브랜치를 지정한다. 승인 화면에 base가 표시된다.
 - `/workflow start --auto <목표>`로 시작하면 제안된 계획(재제안 포함)을 사용자 확인 없이 `via: "auto"`로 승인하고 계획의 종료 지점까지 이어간다. clean 작업 트리·보호 브랜치 같은 승인 조건은 그대로 검사하며, 통과하지 못하면 승인 대기로 남아 `/workflow approve`가 필요하다. 플래그는 사용자 명령에서만 켤 수 있다.
 - `workflow_dispatch` → `workflow_check` → 독립 review 순서로 진행한다. 구현 완료 주장은 검사 증거가 아니다.
@@ -30,12 +30,30 @@ bunx --no-install biome check --error-on-warnings workflow-controller
 
 테스트는 실제 임시 Git 저장소·로컬 bare remote·실제 Pi 이벤트 버스와 subagent 관리 계약의 fake 응답자, PATH의 fake gh 실행 파일을 사용한다. 실제 subagent 구현·GitHub·사용자 설정을 변경하지 않는다.
 
+## Orchestrator 운영과 사용자 승인
+
+사용자는 계획과 실행 권한을 승인하고, 메인은 workflow의 수명 주기를 관리한다. 메인은 시작 명령을 사용자에게 대신 입력해 달라고 요청할 필요가 없다. 시작은 계획 작성 권한이지 구현·Git 전달 승인이 아니다.
+
+| 도구 | 동작 |
+| --- | --- |
+| `workflow_start({ goal, mode? })` | 새 계획을 시작한다. `mode`는 `single`(기본) 또는 `stack`이다. |
+| `workflow_status({})` | 시작 전이나 완료 뒤에도 상태를 확인한다. |
+| `workflow_pause({ reason })` | 관리 실행의 중단을 요청하고 일시정지한다. |
+| `workflow_resume({})` | 메인이 정지했거나 시스템 중단으로 멈춘 작업을 실제 상태 확인 후 재개한다. |
+| `workflow_cancel({ reason })` | 관리 실행을 취소한다. 성공 완료로 처리하거나 파일·커밋·PR을 삭제하지 않는다. |
+
+도구로 시작한 계획도 `workflow_propose` 또는 `workflow_stack_propose`의 실제 승인 UI나 `/workflow approve`가 필요하다. 도구는 `auto`·승인자·강제 완료 인자를 받지 않으며, 앞선 workflow의 `--auto` 권한도 새 workflow로 넘기지 않는다. 메인이 완료를 선언하는 도구는 없고, 기존 검사·필수 검수·전달 확인이 끝나야 `completed`가 된다.
+
+사용자의 `/workflow pause`, Esc, 실행 중단, `/workflow cancel`은 메인이 해제할 수 없는 중단이다. 메인이 다시 pause하거나 cancel한 뒤 start하는 방식으로도 우회할 수 없다. `workflow_block`으로 요청한 사용자 판단도 메인이 스스로 해제하지 못한다. 사용자는 일시정지를 `/workflow resume`으로 해제하고, 취소한 작업 뒤 새 작업은 `/workflow start`로 명시한다.
+
+세션 재시작 자체는 자동 재개하지 않는다. 시스템 중단이 확인된 작업에는 메인이 `workflow_resume`을 호출할 수 있지만 사용자 중단은 재시작 뒤에도 유지한다. 출처가 없는 과거 정지·차단·취소 기록은 사용자 확인을 요구한다. 실행 중인 worker나 검사·원격 확인이 끝나지 않으면 다음 workflow를 시작하지 않는다. 재개 확인 도중 들어온 사용자 중단도 늦은 확인 결과보다 우선한다.
+
 ## Stacked 모드
 
-`--stack`을 명시하면 전체 계획을 한 번 승인하고 선형 스택의 Draft PR들을 순서대로 전달한다. `--stack`이 없으면 기존 단일 모드와 `verify`·`commit`·`pr` 종료 지점을 그대로 사용한다. 단일 모드의 `prBase` 지정은 PR 하나의 base 선택이며 스택 전체를 관리하지 않는다. 분기·합류가 있는 PR 그래프와 독립 요청의 후속 FIFO 대기열은 지원하지 않는다.
+`workflow_start({ goal: "목표", mode: "stack" })` 또는 `/workflow start --stack <목표>`로 스택을 명시하면 전체 계획을 한 번 승인하고 선형 스택의 Draft PR들을 순서대로 전달한다. `--stack`이 없으면 기존 단일 모드와 `verify`·`commit`·`pr` 종료 지점을 그대로 사용한다. 단일 모드의 `prBase` 지정은 PR 하나의 base 선택이며 스택 전체를 관리하지 않는다. 분기·합류가 있는 PR 그래프와 독립 요청의 후속 FIFO 대기열은 지원하지 않는다.
 
 - `/workflow start --stack <목표>`는 읽기 전용 조사 후 `workflow_stack_propose`로 전체 계획을 제안하고 승인받는다.
-- `/workflow start --stack --auto <목표>`는 같은 계획을 사용자 확인 없이 승인한다. `--auto --stack` 순서도 허용한다. `--stack`은 PR 구성 방식, `--auto`는 계획 승인 방식이며 사용자 명령에서만 켠다.
+- `/workflow start --stack --auto <목표>`는 같은 계획을 사용자 확인 없이 승인한다. `--auto --stack` 순서도 허용한다. `--stack` 또는 도구의 `mode: "stack"`은 PR 구성 방식이고, `--auto`는 사용자 명령에서만 켤 수 있는 계획 승인 방식이다.
 - 승인 범위는 계획한 브랜치 생성·전환과 PR별 commit·push·Draft PR 전달을 포함한다. 같은 계획의 다음 PR마다 승인을 다시 요구하지 않는다. 실행 시작 후 계획 변경은 거절하며 `--auto`가 범위 확장이나 이력 재작성 권한을 주지는 않는다.
 - `rootBase`는 `stage` 또는 승인된 비보호 원격 feature 브랜치다. 승인 시 원격 SHA를 고정하며 해당 커밋 객체가 로컬에 없으면 멈춘다. 자동 fetch는 하지 않는다. 대상 브랜치는 보호 브랜치가 아니어야 하며 계획 시 로컬이나 원격에 이미 존재하면 거절한다.
 

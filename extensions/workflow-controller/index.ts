@@ -6,6 +6,7 @@ import {
 	type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import { Type, type TSchema } from "typebox";
+import { Value } from "typebox/value";
 import { WorkflowController } from "./controller.ts";
 import { specSchema, type Options } from "./model.ts";
 
@@ -30,10 +31,11 @@ export function createWorkflowController(options: Options) {
 				label: `Workflow ${name}`,
 				description,
 				parameters,
-				defaultActive: false,
+				defaultActive: ["status", "start"].includes(name),
 				executionMode: "sequential",
 				execute: async (_toolCallId, params, signal, _onUpdate, ctx) => {
 					try {
+						if (!Value.Check(parameters, params)) throw new Error("잘못된 workflow 도구 입력입니다.");
 						const details = await (serial
 							? controller.serial(() => action(params, ctx, signal))
 							: action(params, ctx, signal));
@@ -51,6 +53,34 @@ export function createWorkflowController(options: Options) {
 				},
 			});
 		}
+		tool(
+			"start",
+			"목표의 workflow 초안을 시작한다. 구현·전달은 이후 사용자 계획 승인이 필요하며 자동 승인 권한을 만들거나 상속하지 않는다.",
+			Type.Object(
+				{
+					goal: Type.String({ minLength: 1, pattern: "\\S" }),
+					mode: Type.Optional(Type.Union([Type.Literal("single"), Type.Literal("stack")])),
+				},
+				{ additionalProperties: false },
+			),
+			async (params, ctx) => controller.startFromTool(params, ctx),
+			false,
+		);
+		for (const name of ["pause", "cancel"] as const)
+			tool(
+				name,
+				`Orchestrator 소유 작업을 ${name === "pause" ? "일시정지" : "취소"}한다. 사용자 보류를 변경하거나 성공 완료로 처리하지 않는다.`,
+				Type.Object({ reason: Type.String({ minLength: 1, pattern: "\\S" }) }, { additionalProperties: false }),
+				async (params, ctx) => controller.stopFromTool(name === "pause" ? "paused" : "cancelled", params.reason, ctx),
+				false,
+			);
+		tool(
+			"resume",
+			"Orchestrator 또는 시스템 중단을 명시적으로 복구한다. 사용자 중단·판단 요청은 사용자만 해제할 수 있다.",
+			Type.Object({}, { additionalProperties: false }),
+			async (_params, ctx, signal) => controller.resumeFromTool(ctx, signal),
+			false,
+		);
 		tool("status", "워크플로 정본 상태·증거를 조회한다.", Type.Object({}), async () => controller.status());
 		tool(
 			"propose",

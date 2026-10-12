@@ -66,6 +66,7 @@ export type Delivery = {
 	at: string;
 	details: Record<string, unknown>;
 };
+export type ControlSource = "user" | "orchestrator" | "system";
 export type Workflow = {
 	workflowId: string;
 	repoKey: string;
@@ -77,6 +78,9 @@ export type Workflow = {
 	phase: "drafting" | "awaiting-approval" | "executing" | "reviewing" | "ready-to-deliver" | "completed";
 	control: "running" | "stopping" | "paused" | "blocked" | "cancelled";
 	stopTarget?: "paused" | "cancelled";
+	controlSource?: ControlSource;
+	userHold?: boolean;
+	controlRevision?: number;
 	reason?: string;
 	spec?: Spec;
 	planVersion?: string;

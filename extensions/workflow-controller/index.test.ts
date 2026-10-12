@@ -1721,3 +1721,406 @@ describe("선택형 stacked workflow", () => {
 		expect((await h.state()).stack.planVersion).toBe(original.stack.planVersion);
 	});
 });
+
+describe("Orchestrator lifecycle", () => {
+	it("idle에서도 상태 조회와 시작 도구를 활성화한다", async () => {
+		/* [Given] */ const h = await harness();
+		/* [When] */ await h.hook("session_start", {});
+		/* [Then] */ expect(h.active()).toEqual(expect.arrayContaining(["workflow_status", "workflow_start"]));
+		expect(h.active()).not.toContain("workflow_dispatch");
+		expect(h.tools.get("workflow_start")?.defaultActive).toBe(true);
+	});
+	it.each(["single", "stack"])(
+		"도구로 %s 초안을 시작하되 자기 승인하거나 추가 모델 턴을 만들지 않는다",
+		async (mode) => {
+			/* [Given] */ const h = await harness();
+			/* [When] */ const result = await h.call("start", { goal: "목표 --auto completed", mode });
+			/* [Then] */ expect(result.isError).not.toBe(true);
+			const state = await h.state();
+			expect(state.phase).toBe("drafting");
+			expect(state.mode).toBe(mode === "stack" ? "stack" : undefined);
+			expect(state.autoApprove).toBeUndefined();
+			expect(state.approval).toBeUndefined();
+			expect(h.messages).toHaveLength(0);
+			expect((await h.call("dispatch", { role: "implement", task: "구현" })).isError).toBe(true);
+		},
+	);
+	it("도구 시작의 기본 모드는 single이고 사용자 승인 전에는 구현하지 않는다", async () => {
+		/* [Given] */ const h = await harness();
+		await h.call("start", { goal: "파일 변경" });
+		/* [When] */ await h.call("propose", spec);
+		/* [Then] */ expect((await h.state()).phase).toBe("awaiting-approval");
+		expect((await h.state()).mode).toBeUndefined();
+		expect((await h.call("dispatch", { role: "implement", task: "구현" })).isError).toBe(true);
+		await h.command("approve");
+		expect((await h.call("dispatch", { role: "implement", task: "구현" })).isError).not.toBe(true);
+	});
+	it.each([
+		{ goal: " " },
+		{ goal: "목표", mode: "auto" },
+		{ goal: "목표", auto: true },
+		{ goal: "목표", autoApprove: true },
+		{ goal: "목표", approval: true },
+		{ goal: "목표", actor: "user" },
+	])("시작 입력으로 권한을 위조하거나 빈 목표를 보낼 수 없다 %j", async (input) => {
+		/* [Given] */ const h = await harness();
+		/* [When] */ const result = await h.call("start", input);
+		/* [Then] */ expect(result.isError).toBe(true);
+		expect(h.refs).toHaveLength(0);
+	});
+	it("자동 승인으로 완료한 다음 도구 시작은 새 사용자 승인을 요구한다", async () => {
+		/* [Given] */ const h = await harness();
+		await h.command("start --auto 이전 작업");
+		await h.call("propose", spec);
+		await h.call("check");
+		await h.call("dispatch", { role: "review", task: "검수" });
+		await h.finish(undefined, { finalOutput: "WORKFLOW_VERDICT: pass" });
+		const previous = await h.state();
+		/* [When] */ await h.call("start", { goal: "다음 작업" });
+		await h.call("propose", spec);
+		/* [Then] */ expect(previous.phase).toBe("completed");
+		const current = await h.state();
+		expect(current.workflowId).not.toBe(previous.workflowId);
+		expect(current.autoApprove).toBeUndefined();
+		expect(current.approval).toBeUndefined();
+		expect(current.phase).toBe("awaiting-approval");
+		expect(JSON.parse(await readFile(storedPath(h), "utf8")).phase).toBe("completed");
+	});
+	it("Orchestrator 일시정지는 명시적 도구 재개로만 풀리고 추가 턴을 만들지 않는다", async () => {
+		/* [Given] */ const h = await harness();
+		await h.approve();
+		await h.call("pause", { reason: "조사 대기" });
+		const paused = await h.state();
+		const messages = h.messages.length;
+		/* [When] */ const result = await h.call("resume");
+		/* [Then] */ expect(paused.control).toBe("paused");
+		expect(paused.reason).toBe("조사 대기");
+		expect(result.isError).not.toBe(true);
+		expect((await h.state()).control).toBe("running");
+		expect(h.messages).toHaveLength(messages);
+	});
+	it("Orchestrator 취소는 worker 종료 확인 전까지 새 시작을 거절한다", async () => {
+		/* [Given] */ const h = await harness();
+		await h.approve();
+		await h.call("dispatch", { role: "implement", task: "구현" });
+		/* [When] */ await h.call("cancel", { reason: "작업 폐기" });
+		const waiting = await h.state();
+		const denied = await h.call("start", { goal: "다음 목표" });
+		await h.finish(undefined, { status: "aborted" });
+		const cancelled = await h.state();
+		const next = await h.call("start", { goal: "다음 목표" });
+		/* [Then] */ expect(waiting.control).toBe("stopping");
+		expect(denied.isError).toBe(true);
+		expect(cancelled.control).toBe("cancelled");
+		expect(cancelled.phase).not.toBe("completed");
+		expect(next.isError).not.toBe(true);
+		expect((await h.state()).approval).toBeUndefined();
+	});
+	it.each(["pause", "cancel"])("사용자 %s는 도구 운영과 세션 재시작으로 해제할 수 없다", async (action) => {
+		/* [Given] */ const h = await harness();
+		await h.approve();
+		await h.command(action);
+		const next = await harness(true, h);
+		await next.hook("session_start", {});
+		/* [When] */ const results = await Promise.all([
+			next.call("resume"),
+			next.call("pause", { reason: "우회" }),
+			next.call("cancel", { reason: "우회" }),
+			next.call("start", { goal: "우회" }),
+		]);
+		/* [Then] */ expect(results.every((result) => result.isError)).toBe(true);
+		expect((await next.state()).control).toBe(action === "pause" ? "paused" : "cancelled");
+		await next.command(action === "pause" ? "resume" : "start 새 목표");
+		expect((await next.state()).control).toBe("running");
+	});
+	it.each(["block", "reviewer"])("%s의 사용자 판단 요청은 도구 재개로 풀 수 없다", async (source) => {
+		/* [Given] */ const h = await harness();
+		await h.approve();
+		if (source === "block") await h.call("block", { reason: "사용자 판단 필요" });
+		else {
+			await h.call("check");
+			await h.call("dispatch", { role: "review", task: "검수" });
+			await h.finish(undefined, { finalOutput: "WORKFLOW_VERDICT: blocked" });
+		}
+		/* [When] */ const result = await h.call("resume");
+		/* [Then] */ expect(result.isError).toBe(true);
+		expect((await h.state()).control).toBe("blocked");
+		await h.command("resume");
+		expect((await h.state()).control).toBe("running");
+	});
+	it("실제 사용자 aborted 이벤트는 Orchestrator 일시정지에도 사용자 보류를 남긴다", async () => {
+		/* [Given] */ const h = await harness();
+		await h.approve();
+		await h.call("pause", { reason: "운영 대기" });
+		/* [When] */ await h.hook("agent_settled", { aborted: true });
+		/* [Then] */ expect((await h.call("resume")).isError).toBe(true);
+		expect((await h.state()).control).toBe("paused");
+	});
+	it("실제 Esc로 중단한 worker의 늦은 종료와 재시작은 사용자 보류를 지우지 않는다", async () => {
+		/* [Given] */ const h = await harness();
+		h.ctx.hasUI = true;
+		await h.hook("session_start", {});
+		await h.approve();
+		await h.call("dispatch", { role: "implement", task: "구현" });
+		/* [When] */ h.input("\x1b");
+		await expect.poll(async () => (await h.state()).control).toBe("stopping");
+		await h.finish(undefined, { status: "aborted" });
+		await h.hook("session_shutdown", {});
+		const next = await harness(true, h);
+		await next.hook("session_start", {});
+		/* [Then] */ expect((await next.call("resume")).isError).toBe(true);
+		expect((await next.state()).control).toBe("paused");
+	});
+	it("세션 재시작으로 중단한 running 정본은 도구로 명시 복구할 수 있다", async () => {
+		/* [Given] */ const h = await harness();
+		await h.approve();
+		await h.call("dispatch", { role: "implement", task: "구현" });
+		const next = await harness(true, h);
+		await next.hook("session_start", {});
+		const paused = await next.state();
+		/* [When] */ const result = await next.call("resume");
+		/* [Then] */ expect(paused.control).toBe("paused");
+		expect(result.isError).not.toBe(true);
+		expect((await next.state()).control).toBe("running");
+		expect((await next.call("dispatch", { role: "implement", task: "재구현" })).isError).toBe(true);
+		await next.call("recover", { attemptId: paused.attempts[0].id, assessment: "partial", notes: "실제 파일 확인" });
+		expect((await next.call("dispatch", { role: "implement", task: "재구현" })).isError).not.toBe(true);
+	});
+	it.each(["paused", "blocked", "cancelled", "running"])(
+		"출처 없는 레거시 %s 정본은 관찰된 시스템 중단만 도구 복구한다",
+		async (control) => {
+			/* [Given] */ const h = await harness();
+			await h.approve();
+			const stored = await h.state();
+			stored.control = control;
+			stored.controlSource = undefined;
+			stored.userHold = undefined;
+			stored.controlRevision = undefined;
+			await writeFile(storedPath(h), JSON.stringify(stored));
+			const next = await harness(true, h);
+			await next.hook("session_start", {});
+			/* [When] */ const result = await next.call("resume");
+			/* [Then] */ expect(result.isError === true).toBe(control !== "running");
+			expect((await next.state()).control).toBe(control === "running" ? "running" : control);
+		},
+	);
+	it.each([
+		["pause", { reason: " " }],
+		["cancel", { reason: "" }],
+		["resume", { actor: "user" }],
+		["pause", { reason: "운영", actor: "user" }],
+	])("운영 도구 %s도 빈 이유와 사용자 사칭을 거절한다", async (tool, input) => {
+		/* [Given] */ const h = await harness();
+		await h.approve();
+		/* [When] */ const result = await h.call(tool as string, input);
+		/* [Then] */ expect(result.isError).toBe(true);
+		expect((await h.state()).control).toBe("running");
+	});
+	it("재개 네트워크 대기 중 사용자 중단은 같은 owner의 늦은 완료보다 우선한다", async () => {
+		/* [Given] */ const h = await harness();
+		const fake = await fakeRemote(h);
+		await h.ready({ ...spec, endpoint: "pr" });
+		await h.call("pause", { reason: "PR 확인 대기" });
+		git(h.repo, "commit", "-am", "전달");
+		git(h.repo, "push", "origin", "feature/workflow");
+		await fake.openPr();
+		const gate = await fake.gate();
+		let result: any;
+		await fake.withGh(async () => {
+			const resuming = h.call("resume");
+			const observed = Promise.allSettled([resuming]);
+			try {
+				await gate.entered();
+				/* [When] */ await h.command("pause");
+				await h.hook("session_shutdown", {});
+			} finally {
+				await gate.release();
+				await observed;
+				result = await resuming;
+			}
+		});
+		/* [Then] */ expect(result.isError).toBe(true);
+		expect((await h.state()).control).toBe("paused");
+		expect((await h.state()).phase).not.toBe("completed");
+		expect((await h.state()).deliveries).toHaveLength(0);
+		expect((await h.call("resume")).isError).toBe(true);
+	});
+	it("재개 도구의 사용자 abort는 늦은 PR 확인과 새 시작을 막는다", async () => {
+		/* [Given] */ const h = await harness();
+		const fake = await fakeRemote(h);
+		await h.ready({ ...spec, endpoint: "pr" });
+		await h.call("pause", { reason: "PR 확인 대기" });
+		git(h.repo, "commit", "-am", "전달");
+		git(h.repo, "push", "origin", "feature/workflow");
+		await fake.openPr();
+		const gate = await fake.gate();
+		const abort = new AbortController();
+		let result: any;
+		await fake.withGh(async () => {
+			const resuming = h.call("resume", {}, abort.signal);
+			const observed = Promise.allSettled([resuming]);
+			try {
+				await gate.entered();
+				/* [When] */ abort.abort();
+			} finally {
+				await gate.release();
+				await observed;
+				result = await resuming;
+			}
+		});
+		await h.hook("agent_settled", { aborted: true });
+		/* [Then] */ expect(result.isError).toBe(true);
+		expect((await h.state()).control).toBe("paused");
+		expect((await h.state()).phase).not.toBe("completed");
+		expect((await h.state()).userHold).toBe(true);
+		expect((await h.call("resume")).isError).toBe(true);
+		expect((await h.call("start", { goal: "중단 우회" })).isError).toBe(true);
+	});
+	it("이미 중단된 재개 도구 호출도 사용자 보류를 남긴다", async () => {
+		/* [Given] */ const h = await harness();
+		await h.approve();
+		await h.call("pause", { reason: "운영 대기" });
+		const abort = new AbortController();
+		abort.abort();
+		/* [When] */ const result = await h.call("resume", {}, abort.signal);
+		/* [Then] */ expect(result.isError).toBe(true);
+		expect((await h.state()).control).toBe("paused");
+		expect((await h.state()).userHold).toBe(true);
+	});
+	it("기계적 PR 전달 실패는 도구 재개 때 기존 원격 검증을 통과해야 한다", async () => {
+		/* [Given] */ const h = await harness();
+		const fake = await fakeRemote(h);
+		await h.ready({ ...spec, endpoint: "pr" });
+		await h.call("dispatch", { role: "deliver", task: "전달" });
+		git(h.repo, "commit", "-am", "전달");
+		await fake.withGh(() => h.finish());
+		/* [When] */ const result = await fake.withGh(() => h.call("resume"));
+		/* [Then] */ expect(result.isError).not.toBe(true);
+		expect((await h.state()).control).toBe("running");
+		expect((await h.state()).phase).toBe("ready-to-deliver");
+		expect((await h.state()).deliveries.find((d: any) => d.action === "commit").state).toBe("done");
+	});
+});
+
+describe("Orchestrator lifecycle 경계", () => {
+	it.each(["개선", "복구"])("%s 한도 차단은 도구 pause 후 resume으로 우회하지 못한다", async (limit) => {
+		/* [Given] */ const h = await harness();
+		await h.approve({ ...spec, maxImprovementCycles: 1, maxRecoveries: 0 });
+		if (limit === "복구") {
+			await h.call("dispatch", { role: "implement", task: "구현" });
+			await h.finish(undefined, { status: "failed" });
+			await h.call("recover", {
+				attemptId: (await h.state()).attempts[0].id,
+				assessment: "partial",
+				notes: "파일 확인",
+			});
+		} else {
+			for (let i = 0; i < 2; i++) {
+				await h.call("check");
+				await h.call("dispatch", { role: "review", task: "검수" });
+				await h.finish(undefined, { finalOutput: "WORKFLOW_VERDICT: changes-requested" });
+			}
+		}
+		/* [When] */ await h.call("pause", { reason: "한도 이유 덮어쓰기" });
+		const result = await h.call("resume");
+		/* [Then] */ expect(result.isError).toBe(true);
+		expect((await h.state()).control).not.toBe("running");
+	});
+	it("사용자 재개로 전달을 확인해 완료하면 다음 도구 시작을 막지 않는다", async () => {
+		/* [Given] */ const h = await harness();
+		await h.ready();
+		await h.command("pause");
+		git(h.repo, "commit", "-am", "전달");
+		await h.command("resume");
+		const completed = await h.state();
+		/* [When] */ const result = await h.call("start", { goal: "새 목표" });
+		/* [Then] */ expect(completed.phase).toBe("completed");
+		expect(completed.userHold).toBe(false);
+		expect(result.isError).not.toBe(true);
+		expect((await h.state()).phase).toBe("drafting");
+	});
+	it("같은 프로세스라도 다른 세션의 정본은 도구가 시작하거나 재개하지 않는다", async () => {
+		/* [Given] */ const h = await harness();
+		await h.approve();
+		const stored = await h.state();
+		stored.owner.sessionId = "another-live-session";
+		await writeFile(storedPath(h), JSON.stringify(stored));
+		const next = await harness(true, h);
+		await next.hook("session_start", {});
+		/* [When] */ const result = await next.call("resume");
+		const start = await next.call("start", { goal: "소유권 우회" });
+		/* [Then] */ expect(result.isError).toBe(true);
+		expect(start.isError).toBe(true);
+		expect((await next.state()).owner.sessionId).toBe("another-live-session");
+		expect((await next.state()).control).toBe("running");
+	});
+	it("세션 종료의 시스템 중단은 다음 세션에서 도구로 명시 재개할 수 있다", async () => {
+		/* [Given] */ const h = await harness();
+		await h.approve();
+		await h.hook("session_shutdown", {});
+		const next = await harness(true, h);
+		await next.hook("session_start", {});
+		/* [When] */ const result = await next.call("resume");
+		/* [Then] */ expect(result.isError).not.toBe(true);
+		expect((await next.state()).control).toBe("running");
+	});
+	it("취소 대기 중 늦은 사용자 aborted 신호가 취소를 일시정지로 바꾸지 않는다", async () => {
+		/* [Given] */ const h = await harness();
+		await h.approve();
+		await h.call("dispatch", { role: "implement", task: "구현" });
+		await h.call("cancel", { reason: "폐기" });
+		/* [When] */ await h.hook("agent_settled", { aborted: true });
+		await h.finish(undefined, { status: "aborted" });
+		/* [Then] */ expect((await h.state()).control).toBe("cancelled");
+		expect((await h.call("start", { goal: "사용자 보류 우회" })).isError).toBe(true);
+	});
+	it("도구 재개도 승인 브랜치가 바뀌면 실행을 허용하지 않는다", async () => {
+		/* [Given] */ const h = await harness();
+		await h.approve();
+		await h.call("pause", { reason: "대기" });
+		git(h.repo, "switch", "-c", "feature/another");
+		/* [When] */ const result = await h.call("resume");
+		/* [Then] */ expect(result.isError).toBe(true);
+		expect((await h.state()).control).toBe("paused");
+	});
+	it("부분적인 lifecycle 권한 정본은 추측하지 않고 손상으로 거절한다", async () => {
+		/* [Given] */ const h = await harness();
+		await h.approve();
+		const stored = await h.state();
+		stored.userHold = undefined;
+		await writeFile(storedPath(h), JSON.stringify(stored));
+		const next = await harness(true, h);
+		await next.hook("session_start", {});
+		/* [When] */ const result = await next.call("start", { goal: "새 작업" });
+		/* [Then] */ expect(result.isError).toBe(true);
+		expect((await next.state()).error).toMatch(/손상/);
+	});
+	it("자기 승인이나 강제 완료 도구를 등록하지 않는다", async () => {
+		/* [Given] */ const h = await harness();
+		/* [When] */ const names = [...h.tools.keys()];
+		/* [Then] */ expect(names).not.toContain("workflow_approve");
+		expect(names).not.toContain("workflow_force_complete");
+		expect(names).not.toContain("workflow_end");
+	});
+});
+
+it("세션 종료 뒤에도 이전 worker의 abortPending이 남으면 도구 재개를 거절한다", async () => {
+	/* [Given] */ const h = await harness();
+	await h.approve();
+	await h.call("dispatch", { role: "implement", task: "구현" });
+	await h.hook("session_shutdown", {});
+	const next = await harness(true, h);
+	let stopped = false;
+	next.events.on("subagent:managed:v1:request", (raw: any) => {
+		if (raw.type === "inspect" && raw.owner.generation === 1)
+			raw.respond({ ok: true, runs: stopped ? [] : [{ status: "running", removed: true, abortPending: true }] });
+	});
+	await next.hook("session_start", {});
+	/* [When] */ const pending = await next.call("resume");
+	const waiting = await next.state();
+	stopped = true;
+	const settled = await next.call("resume");
+	/* [Then] */ expect(pending.isError).toBe(true);
+	expect(waiting.control).toBe("paused");
+	expect(settled.isError).not.toBe(true);
+});

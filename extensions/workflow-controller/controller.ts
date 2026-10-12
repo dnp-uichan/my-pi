@@ -38,15 +38,26 @@ import {
 	terminal,
 	verdict,
 	type Attempt,
+	type ControlSource,
 	type Options,
 	type Owner,
 	type Role,
 	type Workflow,
 } from "./model.ts";
 
-export const toolNames = ["status", "propose", "stack_propose", "dispatch", "check", "recover", "block"].map(
-	(name) => `workflow_${name}`,
-);
+export const toolNames = [
+	"status",
+	"start",
+	"pause",
+	"resume",
+	"cancel",
+	"propose",
+	"stack_propose",
+	"dispatch",
+	"check",
+	"recover",
+	"block",
+].map((name) => `workflow_${name}`);
 type ManagedEvent =
 	| {
 			type: "claim";
@@ -136,7 +147,7 @@ export class WorkflowController {
 	}
 	private requireState(): Workflow {
 		if (this.fatal) throw new Error(this.fatal);
-		if (!this.state) throw new Error("워크플로가 없습니다. /workflow start를 사용하세요.");
+		if (!this.state) throw new Error("워크플로가 없습니다. workflow_start 또는 /workflow start를 사용하세요.");
 		if (!this.owned()) throw new Error("다른 세션 소유 워크플로입니다. 읽기 전용입니다.");
 		if (terminal(this.state)) throw new Error("종료된 워크플로입니다.");
 		return this.state;
@@ -158,6 +169,7 @@ export class WorkflowController {
 		const state = this.state;
 		const enabled = state && this.owned() && !this.fatal && !terminal(state);
 		const active = this.pi.getActiveTools().filter((name) => !toolNames.includes(name));
+		const lifecycle = ["workflow_status", "workflow_start"];
 		this.pi.setActiveTools(
 			enabled
 				? [
@@ -166,7 +178,7 @@ export class WorkflowController {
 							(name) => name !== (state.mode === "stack" ? "workflow_propose" : "workflow_stack_propose"),
 						),
 					]
-				: active,
+				: [...active, ...lifecycle],
 		);
 		this.context?.ui.setStatus(
 			"workflow",
@@ -201,6 +213,19 @@ export class WorkflowController {
 			},
 		});
 		return response;
+	}
+	private assertRunsStopped(state: Workflow): void {
+		const generations = new Set([state.owner.generation, ...state.attempts.map((attempt) => attempt.generation)]);
+		for (const generation of generations) {
+			const response = this.request("inspect", { owner: { workflowId: state.workflowId, generation } }) as
+				| { ok?: boolean; runs?: { status: string; abortPending?: boolean }[] }
+				| undefined;
+			if (response?.ok !== true || !Array.isArray(response.runs))
+				throw new Error("관리 실행 종료 확인 불가: inspect 응답이 없습니다.");
+			/* remove는 취소 요청일 뿐이다. 실제 종료 전에는 다음 소유 세대로 넘어가지 않는다. */
+			if (response.runs.some((run) => run.status === "running" || run.abortPending))
+				throw new Error("아직 종료하지 않은 관리 작업이 있습니다.");
+		}
 	}
 	async command(args: string, ctx: ExtensionContext): Promise<void> {
 		this.context = ctx;
@@ -249,10 +274,46 @@ export class WorkflowController {
 			this.notify(String(error));
 		}
 	}
-	private async start(goal: string, auto: boolean, stack = false): Promise<void> {
+	async startFromTool(input: { goal: string; mode?: "single" | "stack" }, ctx: ExtensionToolContext): Promise<void> {
+		await this.serial(async () => {
+			this.context = ctx;
+			if (this.state?.userHold) throw new Error("사용자 보류는 /workflow resume 또는 /workflow start로만 해제합니다.");
+			await this.start(input.goal.trim(), false, input.mode === "stack", "orchestrator");
+		});
+	}
+	async stopFromTool(target: "paused" | "cancelled", reason: string, ctx: ExtensionToolContext): Promise<void> {
+		await this.serial(async () => {
+			this.context = ctx;
+			await this.stop(target, "orchestrator", reason.trim());
+		});
+	}
+	async resumeFromTool(ctx: ExtensionToolContext, signal?: AbortSignal): Promise<void> {
+		const state = await this.serial(async () => {
+			this.context = ctx;
+			return this.state;
+		});
+		let stopping: Promise<void> | undefined;
+		const pause = () => {
+			stopping ??= this.serial(async () => {
+				if (state && this.state === state && this.owned() && !terminal(state)) await this.stop("paused", "user");
+			}).catch((error) => this.notify(String(error)));
+		};
+		signal?.addEventListener("abort", pause, { once: true });
+		try {
+			if (signal?.aborted) pause();
+			await this.resume("orchestrator", signal);
+		} finally {
+			signal?.removeEventListener("abort", pause);
+			await stopping;
+		}
+	}
+	private async start(goal: string, auto: boolean, stack = false, source: ControlSource = "user"): Promise<void> {
 		if (this.fatal || this.readOnly) throw new Error(this.fatal ?? "다른 프로세스 소유 워크플로입니다.");
+		if (this.state && !this.owned()) throw new Error("다른 세션 소유 워크플로입니다.");
 		if (this.state && !terminal(this.state)) throw new Error("세션당 비종료 워크플로는 하나입니다.");
-		if (!goal) throw new Error("목표가 필요합니다.");
+		if (this.checking || this.delivering || (this.state && activeAttempts(this.state).length))
+			throw new Error("아직 종료하지 않은 작업이 있습니다.");
+		if (!goal.trim()) throw new Error("목표가 필요합니다.");
 		const capabilities = this.request("capabilities") as { version?: number; features?: string[] } | undefined;
 		if (
 			capabilities?.version !== 1 ||
@@ -261,6 +322,7 @@ export class WorkflowController {
 			)
 		)
 			throw new Error("subagent 관리 API v1 지원이 필요합니다.");
+		if (this.state) this.assertRunsStopped(this.state);
 		const current = await snapshot(this.context?.cwd ?? "");
 		this.state = {
 			workflowId: randomUUID(),
@@ -271,6 +333,9 @@ export class WorkflowController {
 			...(auto ? { autoApprove: true as const } : {}),
 			phase: "drafting",
 			control: "running",
+			controlSource: source,
+			userHold: false,
+			controlRevision: 0,
 			attempts: [],
 			checks: [],
 			deliveries: [],
@@ -292,9 +357,10 @@ export class WorkflowController {
 			repoKey: this.state.repoKey,
 			repoRoot: this.state.repoRoot,
 		});
-		this.pi.sendUserMessage(
-			`목표: ${goal}\n읽기 전용으로 조사하고 ${stack ? "workflow_stack_propose로 선형 PR 분할·rootBase·각 branch·checks·requiredReviews·ciChecks·integrationChecks·integrationReviews" : "workflow_propose로 계획·검사 명령·종료 지점"}을 제안하세요. ${auto ? "사용자가 --auto로 시작해 계획은 안전 조건을 통과하면 자동 승인됩니다. 승인되면 사용자에게 묻지 말고 이어서 진행하세요." : "사용자 승인 전에는 구현하지 마세요."} 승인 후에는 workflow_dispatch로 작업·독립 검수를 분담하고 workflow_check로 검증하세요. commit·push·PR은 직접 실행하지 말고 검수 통과 뒤 workflow_dispatch role deliver로 전달 worker에게 맡기세요. merge·배포 금지.`,
-		);
+		if (source === "user")
+			this.pi.sendUserMessage(
+				`목표: ${goal}\n읽기 전용으로 조사하고 ${stack ? "workflow_stack_propose로 선형 PR 분할·rootBase·각 branch·checks·requiredReviews·ciChecks·integrationChecks·integrationReviews" : "workflow_propose로 계획·검사 명령·종료 지점"}을 제안하세요. ${auto ? "사용자가 --auto로 시작해 계획은 안전 조건을 통과하면 자동 승인됩니다. 승인되면 사용자에게 묻지 말고 이어서 진행하세요." : "사용자 승인 전에는 구현하지 마세요."} 승인 후에는 workflow_dispatch로 작업·독립 검수를 분담하고 workflow_check로 검증하세요. commit·push·PR은 직접 실행하지 말고 검수 통과 뒤 workflow_dispatch role deliver로 전달 worker에게 맡기세요. merge·배포 금지.`,
+			);
 	}
 	status(): Workflow | { error: string } {
 		if (this.fatal) return { error: this.fatal };
@@ -714,6 +780,7 @@ export class WorkflowController {
 			this.owned() &&
 			!this.fatal &&
 			sameOwner(ownerOf(state), ownerOf(observed)) &&
+			state.controlRevision === observed.controlRevision &&
 			state.stack?.planVersion === observed.stack?.planVersion &&
 			state.stack?.index === observed.stack?.index &&
 			state.phase === observed.phase &&
@@ -743,6 +810,7 @@ export class WorkflowController {
 					this.applyInspection(state, inspection.kind);
 				else {
 					state.control = "blocked";
+					state.controlSource = "system";
 					state.reason = reason;
 				}
 				if (state.stack?.invalidatedFrom !== undefined) {
@@ -824,12 +892,16 @@ export class WorkflowController {
 			state.phase = state.spec?.endpoint === "verify" && !state.stack ? "completed" : "ready-to-deliver";
 		}
 		if (attempt.verdict === "blocked") {
+			state.controlSource = "user";
+			state.userHold = true;
+			state.controlRevision = (state.controlRevision ?? 0) + 1;
 			state.control = "blocked";
 			state.reason = "검수에서 사용자 판단을 요청했습니다.";
 		}
 		if (attempt.verdict === "changes-requested") {
 			if (state.improvementCycles >= (state.spec?.maxImprovementCycles ?? 3)) {
 				state.control = "blocked";
+				state.controlSource = "system";
 				state.reason = "개선 한도 초과";
 			} else {
 				state.improvementCycles++;
@@ -850,6 +922,7 @@ export class WorkflowController {
 		state.phase = "executing";
 		if (state.improvementCycles >= (state.spec?.maxImprovementCycles ?? 3)) {
 			state.control = "blocked";
+			state.controlSource = "system";
 			state.reason = "개선 한도 초과";
 		} else {
 			state.improvementCycles++;
@@ -861,7 +934,7 @@ export class WorkflowController {
 		let stopping: Promise<void> | undefined;
 		const pause = () => {
 			this.checkAbort?.abort();
-			stopping ??= this.serial(() => this.stop("paused")).catch((error) => this.notify(String(error)));
+			stopping ??= this.serial(() => this.stop("paused", "user")).catch((error) => this.notify(String(error)));
 		};
 		signal?.addEventListener("abort", pause, { once: true });
 		try {
@@ -927,7 +1000,9 @@ export class WorkflowController {
 					killGraceMs: this.options.checkKillGraceMs,
 					timeoutMs: this.options.checkTimeoutMs,
 					onTimeout: () => {
-						void this.serial(() => this.stop("paused")).catch((error) => this.notify(String(error)));
+						void this.serial(() => this.stop("paused", "system", "검사 시간 초과")).catch((error) =>
+							this.notify(String(error)),
+						);
 					},
 				});
 				await this.serial(async () => {
@@ -960,6 +1035,7 @@ export class WorkflowController {
 			await this.serial(async () => {
 				if (this.state === state && state.stack && state.control === "running" && !this.fatal) {
 					state.control = "blocked";
+					state.controlSource = "system";
 					state.reason = `스택 검사 실패: ${String(error)}`;
 					await this.persist("stack check blocked");
 				}
@@ -1001,6 +1077,7 @@ export class WorkflowController {
 		state.recoveries++;
 		if (state.recoveries > (state.spec?.maxRecoveries ?? 2)) {
 			state.control = "blocked";
+			state.controlSource = "system";
 			state.reason = "복구 한도 초과";
 		}
 		await this.persist("recovered");
@@ -1009,24 +1086,33 @@ export class WorkflowController {
 		const state = this.running();
 		if (!reason.trim()) throw new Error("차단 사유가 필요합니다.");
 		state.control = "blocked";
+		state.controlSource = "user";
+		state.userHold = true;
+		state.controlRevision = (state.controlRevision ?? 0) + 1;
 		state.reason = reason;
 		await this.persist("blocked");
 	}
-	private async stop(target: "paused" | "cancelled"): Promise<void> {
+	private async stop(target: "paused" | "cancelled", source: ControlSource = "user", reason?: string): Promise<void> {
 		const state = this.state;
 		if (!state || !this.owned() || terminal(state)) throw new Error("중단할 소유 워크플로가 없습니다.");
+		if (source === "orchestrator" && state.userHold)
+			throw new Error("사용자 보류를 Orchestrator가 변경할 수 없습니다.");
+		state.userHold ||= source === "user";
+		state.controlSource = state.userHold ? "user" : source;
+		state.controlRevision = (state.controlRevision ?? 0) + 1;
 		this.checkAbort?.abort();
 		if (this.fatal) {
 			this.request("cancel", { owner: ownerOf(state), reason: `workflow ${target}` });
 			throw new Error(this.fatal);
 		}
 		state.control = "stopping";
-		state.stopTarget = target;
-		state.reason = undefined;
+		/* 이미 요청된 취소를 늦은 pause signal이나 timeout으로 되돌리지 않는다. */
+		state.stopTarget = state.stopTarget === "cancelled" ? "cancelled" : target;
+		if (!/(?:개선|복구) 한도 초과/.test(state.reason ?? "")) state.reason = reason;
 		this.checkAbort?.abort();
 		let error: unknown;
 		try {
-			await this.persist(`stopping ${target}`);
+			await this.persist(`stopping ${target}${source === "orchestrator" ? `: ${reason}` : ""}`);
 		} catch (caught) {
 			error = caught;
 		}
@@ -1041,7 +1127,7 @@ export class WorkflowController {
 			this.stopTimer = setTimeout(() => {
 				void this.serial(async () => {
 					if (this.state === state && state.control === "stopping" && !this.fatal) {
-						state.reason = "종료 미확인";
+						if (!/(?:개선|복구) 한도 초과/.test(state.reason ?? "")) state.reason = "종료 미확인";
 						await this.persist("stop timeout");
 					}
 				}).catch((error) => this.notify(String(error)));
@@ -1057,17 +1143,25 @@ export class WorkflowController {
 			!this.checking
 		) {
 			this.state.control = this.state.stopTarget ?? "paused";
-			this.state.reason = undefined;
+			if (/^(?:종료 미확인|관리 중단 응답 없음)/.test(this.state.reason ?? "")) this.state.reason = undefined;
 			clearTimeout(this.stopTimer);
 		}
 	}
-	private async resume(): Promise<void> {
+	private async resume(source: "user" | "orchestrator" = "user", signal?: AbortSignal): Promise<void> {
 		const inspection = await this.serial(async () => {
 			const state = this.requireState();
-			if (!["paused", "blocked"].includes(state.control) || /(?:개선|복구) 한도 초과/.test(state.reason ?? ""))
+			if (signal?.aborted) throw new Error("사용자가 재개를 중단했습니다.");
+			if (source === "orchestrator" && state.userHold)
+				throw new Error("사용자 중단·판단 보류는 /workflow resume으로만 해제합니다.");
+			if (
+				!["paused", "blocked"].includes(state.control) ||
+				/(?:개선|복구) 한도 초과/.test(state.reason ?? "") ||
+				state.recoveries > (state.spec?.maxRecoveries ?? 2)
+			)
 				throw new Error("재개할 수 없는 상태입니다.");
 			if (activeAttempts(state).length || this.delivering || this.checking)
 				throw new Error("아직 종료하지 않은 작업이 있습니다.");
+			this.assertRunsStopped(state);
 			state.resumeSnapshot =
 				state.approval && state.stack?.stage !== "preparing"
 					? await this.approved(state)
@@ -1093,23 +1187,34 @@ export class WorkflowController {
 					? await this.inspectResult(observed, kind)
 					: undefined;
 			await this.serial(async () => {
-				if (!this.ownsInspection(inspection) || !["paused", "blocked"].includes(state.control))
+				if (signal?.aborted || !this.ownsInspection(inspection) || !["paused", "blocked"].includes(state.control))
 					throw new Error("재개 도중 상태가 변경되었습니다.");
 				state.deliveries = observed.deliveries;
 				state.stack = observed.stack;
 				if (result?.complete) {
 					this.applyInspection(state, kind);
 					if (terminal(state)) {
+						state.control = "running";
+						state.controlSource = source;
+						state.userHold = false;
+						state.controlRevision = (state.controlRevision ?? 0) + 1;
+						state.stopTarget = undefined;
+						state.reason = undefined;
 						await this.persist("resume reconciled completed");
 						return;
 					}
 				}
 				state.control = "running";
+				state.controlSource = source;
+				state.userHold = false;
+				state.controlRevision = (state.controlRevision ?? 0) + 1;
+				state.stopTarget = undefined;
 				state.reason = undefined;
 				await this.persist("resume");
-				this.pi.sendUserMessage(
-					`워크플로 재개: ${state.phase}. 중단·실패한 implement는 workflow_recover로 HEAD·지문·status를 확인한 뒤 다시 실행하세요. 현재 상태는 workflow_status로 확인하세요.`,
-				);
+				if (source === "user")
+					this.pi.sendUserMessage(
+						`워크플로 재개: ${state.phase}. 중단·실패한 implement는 workflow_recover로 HEAD·지문·status를 확인한 뒤 다시 실행하세요. 현재 상태는 workflow_status로 확인하세요.`,
+					);
 			});
 		} catch (error) {
 			await this.serial(async () => {
@@ -1122,6 +1227,7 @@ export class WorkflowController {
 						state.reviewResults = undefined;
 					}
 					state.control = "blocked";
+					state.controlSource = state.userHold ? "user" : "system";
 					state.reason = String(error);
 					await this.persist("resume reconciliation blocked");
 				}
@@ -1136,6 +1242,14 @@ export class WorkflowController {
 				}
 			});
 		}
+	}
+
+	private pauseInterrupted(state: Workflow, reason: string): void {
+		if (terminal(state) || !["running", "stopping"].includes(state.control)) return;
+		state.control = "paused";
+		state.controlSource = state.userHold ? "user" : "system";
+		state.controlRevision = (state.controlRevision ?? 0) + 1;
+		if (!/(?:개선|복구) 한도 초과/.test(state.reason ?? "")) state.reason = reason;
 	}
 
 	async sessionStart(ctx: ExtensionContext): Promise<void> {
@@ -1158,7 +1272,11 @@ export class WorkflowController {
 					const data = ref.data as { workflowId: string; repoKey: string; repoRoot: string };
 					this.state = await load(this.options.agentDir, data.repoKey, data.workflowId, data.repoRoot);
 					this.unresolvedRef = false;
-					if (this.state.owner.pid !== process.pid && alive(this.state.owner.pid)) this.readOnly = true;
+					if (
+						alive(this.state.owner.pid) &&
+						(this.state.owner.pid !== process.pid || this.state.owner.sessionId !== ctx.sessionManager.getSessionId())
+					)
+						this.readOnly = true;
 					else {
 						for (const attempt of activeAttempts(this.state)) attempt.status = "interrupted";
 						this.state.owner = {
@@ -1167,10 +1285,7 @@ export class WorkflowController {
 							pid: process.pid,
 							generation: this.state.owner.generation + 1,
 						};
-						if (!terminal(this.state) && ["running", "stopping"].includes(this.state.control)) {
-							this.state.control = "paused";
-							this.state.reason = "세션 재시작으로 중단, /workflow resume 필요";
-						}
+						this.pauseInterrupted(this.state, "세션 재시작으로 중단, /workflow resume 필요");
 						await this.persist("session restart");
 					}
 				} catch (error) {
@@ -1219,10 +1334,7 @@ export class WorkflowController {
 				return;
 			}
 			for (const attempt of activeAttempts(this.state)) attempt.status = "interrupted";
-			if (["running", "stopping"].includes(this.state.control)) {
-				this.state.control = "paused";
-				this.state.reason = "세션 종료로 중단";
-			}
+			this.pauseInterrupted(this.state, "세션 종료로 중단");
 			await this.persist("session shutdown");
 		}).catch((error) => this.notify(String(error)));
 	}
@@ -1235,7 +1347,7 @@ export class WorkflowController {
 		return this.serial(async () => {
 			const state = this.state;
 			if (!state || !this.owned() || terminal(state)) return;
-			if (event.outcome === "aborted" && (state.control === "running" || this.fatal)) {
+			if (event.outcome === "aborted") {
 				await this.stop("paused").catch((error) => this.notify(String(error)));
 				return;
 			}
@@ -1278,7 +1390,7 @@ export class WorkflowController {
 		if (event.aborted !== true) return;
 		await this.serial(async () => {
 			const state = this.state;
-			if (!state || !this.owned() || terminal(state) || (state.control !== "running" && !this.fatal)) return;
+			if (!state || !this.owned() || terminal(state)) return;
 			await this.stop("paused").catch((error) => this.notify(String(error)));
 		});
 	}
