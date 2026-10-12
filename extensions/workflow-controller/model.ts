@@ -14,12 +14,16 @@ export const specSchema = Type.Object({
 });
 export type Spec = Required<Static<typeof specSchema>>;
 export type Role = "implement" | "review" | "research";
+/* 메인이 고를 수 있는 worker effort. off·minimal·max는 품질·비용 극단이라 제외한다. */
+export const DISPATCH_THINKING_LEVELS = ["low", "medium", "high", "xhigh"] as const;
+export type DispatchThinking = (typeof DISPATCH_THINKING_LEVELS)[number];
 export type Owner = { workflowId: string; generation: number };
 export type Attempt = {
 	id: string;
 	role: Role;
 	agent: string;
 	contextMode: "main" | "isolated";
+	thinking?: DispatchThinking;
 	task: string;
 	generation: number;
 	status: "dispatching" | "running" | "completed" | "failed" | "aborted" | "interrupted" | "rejected";

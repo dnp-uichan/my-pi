@@ -195,6 +195,7 @@ const attemptSchema = Type.Object({
 	role: choices(["implement", "review", "research"]),
 	agent: text,
 	contextMode: choices(["main", "isolated"]),
+	thinking: Type.Optional(choices(["low", "medium", "high", "xhigh"])),
 	task: text,
 	generation: Type.Integer({ minimum: 1 }),
 	status: choices(["dispatching", "running", "completed", "failed", "aborted", "interrupted", "rejected"]),

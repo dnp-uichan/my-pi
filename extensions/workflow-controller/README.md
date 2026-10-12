@@ -5,6 +5,7 @@ Pi 메인이 판단과 분담을 맡고, 이 확장은 승인·상태·검사 �
 - `/workflow start <목표>`로 읽기 전용 조사와 계획 제안을 시작한다.
 - `workflow_propose`의 실제 UI에서 `승인`을 선택하거나 `/workflow approve`로 승인한다. 모델의 텍스트·도구 인자는 승인이 아니다.
 - `workflow_dispatch` → `workflow_check` → 독립 review 순서로 진행한다. 구현 완료 주장은 검사 증거가 아니다.
+- 모델은 agent 설정을 따르고, effort는 메인이 dispatch마다 `thinking`(`low`·`medium`·`high`·`xhigh`)으로 정할 수 있다. 생략하면 agent 기본값이며 선택한 값은 attempt에 기록된다. subagent 관리 API의 `thinking` 기능이 없으면 시작하지 않는다.
 - `/workflow status|pause|resume|cancel`로 제어한다. 검사 중단은 독립 프로세스 그룹 전체에 SIGTERM을 보내고 기본 2초 뒤 SIGKILL로 강제 종료한다. 그룹 소멸과 child의 close 확인 전에는 stopping을 유지해 재개·dispatch를 거절한다. 검사 타임아웃(기본 10분)도 같은 절차로 일시정지한다. 취소는 파일 rollback이 아니며 세션 재시작은 자동 재개하지 않는다.
 - 검사 통과마다 새 `verification.id`를 만들고 review attempt에 연결한다. 증거를 무효화하거나 재검사할 때 실행 중인 이전 review도 무효로 표시한다. 이전 review의 늦은 판정은 기록만 남기고, 새 세대와 시작·종료 지문이 모두 일치하는 판정만 반영한다. 세대 없는 기존 정본의 증거는 무효화해 재검사를 요구한다.
 - 실패·중단된 구현은 `workflow_recover`로 실제 HEAD·작업 트리 지문·Git 상태를 확인해야 다시 실행할 수 있다.

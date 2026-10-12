@@ -210,7 +210,7 @@ P0/P1, 필수 gate 실패·실행 불가 또는 다른 blocker가 남으면 다�
 사용자가 `/workflow start <목표>`로 시작한 작업에서는 `workflow-controller` 확장이 승인·진행 상태·검증 증거·중단·전달을 기록하고 다음 단계 조건을 판정한다. 계획과 분담은 계속 메인이 맡는다. 관리용 subagent API가 없으면 시작이 거절되며 지침만으로 대신 진행하지 않는다.
 
 - 읽기 전용 조사 뒤 `workflow_propose`로 목표·제외 범위·완료 조건·검사 명령·종료 지점·개선 한도를 제안한다. 승인은 사용자 선택이나 `/workflow approve`로만 성립한다.
-- 구현·검수·조사 worker는 `workflow_dispatch`로 실행한다. 이 모드에서는 관리되지 않는 `subagent` 실행과 직접 `git commit`·`git push`·`gh pr create` 같은 명령을 확장이 막는다. 가드는 OS 수준 격리가 아니다.
+- 구현·검수·조사 worker는 `workflow_dispatch`로 실행한다. 모델은 agent 설정을 유지하고, effort는 작업 난이도로 판단해 `thinking`에 지정한다. 단순 수정은 `low`, 일반 구현은 `medium`·`high`, 설계가 얽히거나 검수가 까다로운 변경은 `xhigh`이며 생략하면 agent 기본값이다. 이 모드에서는 관리되지 않는 `subagent` 실행과 직접 `git commit`·`git push`·`gh pr create` 같은 명령을 확장이 막는다. 가드는 OS 수준 격리가 아니다.
 - 구현 worker의 완료 보고는 완료가 아니다. `workflow_check`의 검사 통과와, 구현 agent와 다른 reviewer의 `WORKFLOW_VERDICT: pass`가 같은 작업 트리 지문에 묶여야 다음 단계로 간다.
 - 실패하거나 중단된 구현은 `workflow_recover`로 실제 작업 공간 상태를 기록한 뒤 다시 실행한다. 사용자 판단이 필요하면 `workflow_block`으로 멈추고 질문한다.
 - 전달은 승인한 종료 지점까지만 `workflow_deliver`로 수행한다. merge·배포는 하지 않는다.

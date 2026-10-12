@@ -11,6 +11,8 @@ import { alive, fingerprint, load, runCheck, save, snapshot } from "./io.ts";
 import {
 	activeAttempts,
 	boundOutput,
+	DISPATCH_THINKING_LEVELS,
+	type DispatchThinking,
 	dispatchCommand,
 	guard,
 	hash,
@@ -54,8 +56,28 @@ type ManagedEvent =
 			stopReason?: string;
 			retryCount: number;
 	  };
-export type DispatchInput = { role: Role; task: string; agent?: string; contextMode?: "main" | "isolated" };
+export type DispatchInput = {
+	role: Role;
+	task: string;
+	agent?: string;
+	contextMode?: "main" | "isolated";
+	thinking?: string;
+};
 type RecoverInput = { attemptId: string; assessment: "complete" | "partial" | "unknown"; notes: string };
+
+function dispatchOptions(input: DispatchInput): {
+	agent: string;
+	mode: "main" | "isolated";
+	thinking?: DispatchThinking;
+} {
+	const agent = input.agent ?? { implement: "worker", review: "reviewer", research: "searcher" }[input.role];
+	const mode = input.contextMode ?? (input.role === "implement" ? "main" : "isolated");
+	if (!/^[a-zA-Z0-9_][a-zA-Z0-9_-]*$/.test(agent) || !["main", "isolated"].includes(mode))
+		throw new Error("잘못된 agent·contextMode");
+	if (input.thinking !== undefined && !(DISPATCH_THINKING_LEVELS as readonly string[]).includes(input.thinking))
+		throw new Error(`effort는 ${DISPATCH_THINKING_LEVELS.join("·")} 중 하나여야 합니다.`);
+	return { agent, mode, thinking: input.thinking as DispatchThinking | undefined };
+}
 
 export class WorkflowController {
 	private state?: Workflow;
@@ -205,7 +227,7 @@ export class WorkflowController {
 		const capabilities = this.request("capabilities") as { version?: number; features?: string[] } | undefined;
 		if (
 			capabilities?.version !== 1 ||
-			!["claim", "cancel", "inspect", "finished", "no-outer-retry"].every((feature) =>
+			!["claim", "cancel", "inspect", "finished", "no-outer-retry", "thinking"].every((feature) =>
 				capabilities.features?.includes(feature),
 			)
 		)
@@ -339,10 +361,13 @@ export class WorkflowController {
 		if (!["implement", "review", "research"].includes(input.role) || !input.task?.trim())
 			throw new Error("역할·작업이 필요합니다.");
 		if (!["executing", "reviewing", "ready-to-deliver"].includes(state.phase)) throw new Error("실행 단계가 아닙니다.");
-		const agent = input.agent ?? { implement: "worker", review: "reviewer", research: "searcher" }[input.role];
-		const mode = input.contextMode ?? (input.role === "implement" ? "main" : "isolated");
-		if (!/^[a-zA-Z0-9_][a-zA-Z0-9_-]*$/.test(agent) || !["main", "isolated"].includes(mode))
-			throw new Error("잘못된 agent·contextMode");
+		const { agent, mode, thinking } = dispatchOptions(input);
+		/* 재개한 워크플로도 실행 시점의 subagent가 effort를 실제로 적용하는지 확인한다. */
+		if (thinking) {
+			const capabilities = this.request("capabilities") as { version?: number; features?: string[] } | undefined;
+			if (capabilities?.version !== 1 || !capabilities.features?.includes("thinking"))
+				throw new Error("현재 subagent 관리 API가 effort 지정을 지원하지 않습니다.");
+		}
 		if (input.role === "implement") {
 			if (state.phase !== "executing" || activeAttempts(state).some((a) => a.role === "implement"))
 				throw new Error("구현은 executing에서 한 번에 하나만 실행합니다.");
@@ -373,6 +398,7 @@ export class WorkflowController {
 			role: input.role,
 			agent,
 			contextMode: mode,
+			...(thinking ? { thinking } : {}),
 			task: roleTask(input.role, input.task),
 			generation: state.owner.generation,
 			status: "dispatching",
@@ -414,7 +440,12 @@ export class WorkflowController {
 			return;
 		}
 		attempt.claimed = true;
-		event.respond({ ok: true, owner: ownerOf(state), task: attempt.task });
+		event.respond({
+			ok: true,
+			owner: ownerOf(state),
+			task: attempt.task,
+			...(attempt.thinking ? { thinking: attempt.thinking } : {}),
+		});
 	}
 	private async lifecycle(event: Exclude<ManagedEvent, { type: "claim" }>): Promise<void> {
 		const state = this.state;

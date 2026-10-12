@@ -69,6 +69,12 @@ export function createWorkflowController(options: Options) {
 				task: Type.String({ minLength: 1 }),
 				agent: Type.Optional(Type.String()),
 				contextMode: Type.Optional(Type.Union([Type.Literal("main"), Type.Literal("isolated")])),
+				thinking: Type.Optional(
+					Type.String({
+						description:
+							"worker effort(low·medium·high·xhigh). 작업 난이도로 판단한다. 단순 수정 low, 일반 구현 medium·high, 설계가 얽힌 변경 xhigh. 생략하면 agent 기본값.",
+					}),
+				),
 			}),
 			async (params, ctx) => controller.dispatch(params, ctx),
 			false,

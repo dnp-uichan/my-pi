@@ -104,7 +104,7 @@ async function harness(managed = true, shared?: { root: string; refs: any[] }, o
 	if (managed)
 		events.on("subagent:managed:v1:request", (raw: any) => {
 			if (raw.type === "capabilities")
-				raw.respond({ version: 1, features: ["claim", "cancel", "inspect", "finished", "no-outer-retry"] });
+				raw.respond({ version: 1, features: ["claim", "cancel", "inspect", "finished", "no-outer-retry", "thinking"] });
 			if (raw.type === "cancel") {
 				cancellations.push(raw);
 				raw.respond({
@@ -215,6 +215,50 @@ describe("관리형 워크플로", () => {
 		/* [When] */ await h.command("start 목표");
 		/* [Then] */ expect(h.refs).toHaveLength(0);
 		expect(h.messages.join(" ")).toMatch(/관리 API|지원/);
+	});
+	it("effort 지정을 지원하지 않는 관리 API로는 시작하지 않는다", async () => {
+		/* [Given] */ const h = await harness(false);
+		h.events.on("subagent:managed:v1:request", (raw: any) => {
+			if (raw.type === "capabilities")
+				raw.respond({ version: 1, features: ["claim", "cancel", "inspect", "finished", "no-outer-retry"] });
+		});
+		/* [When] */ await h.command("start 목표");
+		/* [Then] */ expect(h.refs).toHaveLength(0);
+	});
+	it("메인이 정한 effort로 worker를 실행하고 기록한다", async () => {
+		/* [Given] */ const h = await harness();
+		await h.approve();
+		/* [When] */ const result = await h.call("dispatch", { role: "implement", task: "구현", thinking: "low" });
+		/* [Then] */ expect(result.isError).not.toBe(true);
+		expect(h.claims[0].thinking).toBe("low");
+		expect((await h.state()).attempts[0].thinking).toBe("low");
+	});
+	it("실행 시점의 관리 API가 effort를 지원하지 않으면 effort 실행을 거절한다", async () => {
+		/* [Given] */ const h = await harness();
+		await h.approve();
+		h.events.on("subagent:managed:v1:request", (raw: any) => {
+			if (raw.type === "capabilities")
+				raw.respond({ version: 1, features: ["claim", "cancel", "inspect", "finished", "no-outer-retry"] });
+		});
+		/* [When] */ const result = await h.call("dispatch", { role: "implement", task: "구현", thinking: "low" });
+		/* [Then] */ expect(result.isError).toBe(true);
+		expect(h.started).toHaveLength(0);
+		expect((await h.state()).attempts).toHaveLength(0);
+	});
+	it("effort를 정하지 않으면 agent 기본값을 쓴다", async () => {
+		/* [Given] */ const h = await harness();
+		await h.approve();
+		/* [When] */ await h.call("dispatch", { role: "implement", task: "구현" });
+		/* [Then] */ expect(h.claims[0].ok).toBe(true);
+		expect(h.claims[0].thinking).toBeUndefined();
+	});
+	it.each(["max", "off", "minimal", "extreme"])("허용 범위 밖 effort는 실행하지 않는다 (%s)", async (thinking) => {
+		/* [Given] */ const h = await harness();
+		await h.approve();
+		/* [When] */ const result = await h.call("dispatch", { role: "implement", task: "구현", thinking });
+		/* [Then] */ expect(result.isError).toBe(true);
+		expect(h.started).toHaveLength(0);
+		expect((await h.state()).attempts).toHaveLength(0);
 	});
 	it("승인 전에는 작업을 실행하지 않는다", async () => {
 		/* [Given] */ const h = await harness();
