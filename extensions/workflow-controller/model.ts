@@ -12,6 +12,9 @@ export const specSchema = Type.Object({
 	checks: Type.Array(Type.String({ minLength: 1 }), { minItems: 1 }),
 	endpoint: Type.Union([Type.Literal("verify"), Type.Literal("commit"), Type.Literal("pr")]),
 	prDraft: Type.Optional(Type.Literal(true)),
+	deliveryMode: Type.Optional(
+		Type.Literal("existing-commit", { description: "일반 pr 전용. 승인한 현재 SHA를 새 커밋 없이 전달한다." }),
+	),
 	requiredReviews: Type.Optional(
 		Type.Array(Type.String({ minLength: 1, pattern: "\\S" }), { minItems: 1, uniqueItems: true }),
 	),
@@ -21,8 +24,9 @@ export const specSchema = Type.Object({
 	maxImprovementCycles: Type.Optional(Type.Integer({ minimum: 1, maximum: 5 })),
 	maxRecoveries: Type.Optional(Type.Integer({ minimum: 0, maximum: 3 })),
 });
-export type Spec = Omit<Required<Static<typeof specSchema>>, "prBase" | "requiredReviews"> & {
+export type Spec = Omit<Required<Static<typeof specSchema>>, "prBase" | "requiredReviews" | "deliveryMode"> & {
 	prBase?: string;
+	deliveryMode?: "existing-commit";
 	requiredReviews?: string[];
 };
 export type Role = "implement" | "review" | "research" | "deliver" | "prepare";
@@ -131,6 +135,7 @@ export function normalizeSpec(input: Static<typeof specSchema>): Spec {
 		successCriteria: input.successCriteria.map((s) => s.trim()),
 		checks: input.checks.map((s) => s.trim()),
 		endpoint: input.endpoint,
+		...(input.deliveryMode ? { deliveryMode: input.deliveryMode } : {}),
 		prDraft: input.prDraft ?? true,
 		...(input.requiredReviews ? { requiredReviews: input.requiredReviews.map((key) => key.trim()) } : {}),
 		...(input.endpoint === "pr" ? { prBase: input.prBase ?? "stage" } : {}),
@@ -155,7 +160,13 @@ export const protectedBranch = (branch: string) =>
 export function boundOutput(output: string): string {
 	return output.length <= 8000 ? output : `${output.slice(0, 4000)}\n…\n${output.slice(-4000)}`;
 }
-export type DeliverContext = { endpoint: "commit" | "pr"; base: string; branch: string; head: string };
+export type DeliverContext = {
+	endpoint: "commit" | "pr";
+	base: string;
+	branch: string;
+	head: string;
+	deliveryMode?: "existing-commit";
+};
 export function evidenceValid(state: Workflow): boolean {
 	return (
 		!!state.review?.fingerprint &&
@@ -165,6 +176,10 @@ export function evidenceValid(state: Workflow): boolean {
 }
 function deliverContract(context: DeliverContext): string {
 	const skills = join(homedir(), ".claude", "skills");
+	if (context.deliveryMode === "existing-commit") {
+		if (context.endpoint !== "pr") throw new Error("기존 커밋 전달은 pr 종료 지점 전용입니다.");
+		return `승인된 기존 커밋 HEAD ${context.head}를 그대로 전달한다. ${join(skills, "pr", "SKILL.md")}를 읽고 브랜치 ${context.branch}의 SHA가 승인 HEAD와 같고 작업 트리가 clean인지 확인한 뒤 origin에 push하고 base ${context.base}로 Draft PR을 생성하거나 재사용한다. 같은 head의 열린 PR이 있으면 새로 만들지 않는다. 새 commit·amend·rebase·reset·force push·파일 수정·merge·배포 금지. HEAD를 변경하지 않고 이미 끝난 단계는 반복하지 않는다. 마지막에 기존 커밋 해시와 PR URL을 보고한다.`;
+	}
 	const pr =
 		context.endpoint === "pr"
 			? ` 이어서 ${join(skills, "pr", "SKILL.md")}를 읽고 브랜치 ${context.branch}를 origin에 push한 뒤 base ${context.base}로 Draft PR을 만든다. 같은 head의 열린 PR이 있으면 새로 만들지 않는다.`

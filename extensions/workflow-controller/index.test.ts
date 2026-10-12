@@ -10,7 +10,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { afterEach, describe, expect, it } from "vitest";
 import { createWorkflowController } from "./index.ts";
-import type { Options } from "./model.ts";
+import { planVersion, type Options } from "./model.ts";
 
 const roots: string[] = [];
 const harnesses: { hook: (name: string, event: any) => unknown }[] = [];
@@ -2123,4 +2123,289 @@ it("세션 종료 뒤에도 이전 worker의 abortPending이 남으면 도구 �
 	/* [Then] */ expect(pending.isError).toBe(true);
 	expect(waiting.control).toBe("paused");
 	expect(settled.isError).not.toBe(true);
+});
+
+async function existingCommitReady(overrides: Record<string, unknown> = {}) {
+	const h = await harness();
+	await writeFile(join(h.repo, "file.txt"), "already implemented\n");
+	git(h.repo, "commit", "-am", "기존 구현");
+	await h.approve({ ...spec, endpoint: "pr", deliveryMode: "existing-commit", ...overrides });
+	await h.call("check");
+	for (const reviewKey of (overrides.requiredReviews as string[] | undefined) ?? ["code"]) {
+		await h.call("dispatch", { role: "review", reviewKey, task: "현재 커밋 독립 검수" });
+		await h.finish(undefined, { finalOutput: "WORKFLOW_VERDICT: pass" });
+	}
+	return h;
+}
+
+describe("기존 커밋 전달", () => {
+	it("승인된 기존 커밋을 새 커밋 없이 Draft PR로 전달한다", async () => {
+		/* [Given] */ const h = await existingCommitReady();
+		const head = git(h.repo, "rev-parse", "HEAD");
+		const count = git(h.repo, "rev-list", "--count", "HEAD");
+		const fake = await fakeRemote(h);
+		const dispatched = await h.call("dispatch", { role: "deliver", task: "기존 커밋 전달" });
+		git(h.repo, "push", "origin", "feature/workflow");
+		await fake.openPr();
+		/* [When] */ await fake.withGh(() => h.finish());
+		/* [Then] */ expect(dispatched.isError).not.toBe(true);
+		const state = await h.state();
+		expect(state.phase).toBe("completed");
+		expect(state.spec.deliveryMode).toBe("existing-commit");
+		expect(state.approval.head).toBe(head);
+		expect(git(h.repo, "rev-parse", "HEAD")).toBe(head);
+		expect(git(h.repo, "rev-list", "--count", "HEAD")).toBe(count);
+		expect(state.deliveries.find((d: any) => d.action === "commit").details).toMatchObject({ head, reused: true });
+		expect(state.deliveries.find((d: any) => d.action === "pr").details.url).toBe("https://example.invalid/pr/1");
+		expect(h.claims.at(-1).task).toMatch(/pr\/SKILL\.md/);
+		expect(h.claims.at(-1).task).not.toMatch(/commit\/SKILL\.md/);
+		expect(h.claims.at(-1).task).toContain(head);
+		expect(h.claims.at(-1).task).toMatch(/새.*commit.*금지/);
+	});
+	it.each(["verify", "commit"])("%s 종료 지점에는 기존 커밋 전달 모드를 허용하지 않는다", async (endpoint) => {
+		/* [Given] */ const h = await harness();
+		await h.command("start 기존 커밋 전달");
+		/* [When] */ const result = await h.call("propose", { ...spec, endpoint, deliveryMode: "existing-commit" });
+		/* [Then] */ expect(result.isError).toBe(true);
+		expect((await h.state()).spec).toBeUndefined();
+	});
+	it("알 수 없는 전달 모드는 승인하지 않는다", async () => {
+		/* [Given] */ const h = await harness();
+		await h.command("start 기존 커밋 전달");
+		/* [When] */ const result = await h.call("propose", { ...spec, endpoint: "pr", deliveryMode: "unknown" });
+		/* [Then] */ expect(result.isError).toBe(true);
+		expect((await h.state()).spec).toBeUndefined();
+	});
+	it.each(["implement", "prepare"])("기존 커밋 전달 모드에서는 %s worker를 허용하지 않는다", async (role) => {
+		/* [Given] */ const h = await harness();
+		await h.approve({ ...spec, endpoint: "pr", deliveryMode: "existing-commit" });
+		/* [When] */ const result = await h.call("dispatch", { role, task: "작업" });
+		/* [Then] */ expect(result.isError).toBe(true);
+		expect(h.started).toHaveLength(0);
+	});
+	it.each(["check", "review", "deliver"])("기존 커밋 승인 뒤 빈 커밋도 %s에서 거절한다", async (action) => {
+		/* [Given] */ const h = await harness();
+		await h.approve({ ...spec, endpoint: "pr", deliveryMode: "existing-commit" });
+		if (action !== "check") await h.call("check");
+		if (action === "deliver") {
+			await h.call("dispatch", { role: "review", task: "검수" });
+			await h.finish(undefined, { finalOutput: "WORKFLOW_VERDICT: pass" });
+		}
+		git(h.repo, "commit", "--allow-empty", "-m", "승인 뒤 빈 커밋");
+		/* [When] */ const result =
+			action === "check" ? await h.call("check") : await h.call("dispatch", { role: action, task: "작업" });
+		/* [Then] */ expect(result.isError).toBe(true);
+		expect((await h.state()).phase).not.toBe("completed");
+	});
+	it.each(["check", "review", "deliver"])("기존 커밋 승인 뒤 dirty 작업 트리도 %s에서 거절한다", async (action) => {
+		/* [Given] */ const h = await harness();
+		await h.approve({ ...spec, endpoint: "pr", deliveryMode: "existing-commit" });
+		if (action !== "check") await h.call("check");
+		if (action === "deliver") {
+			await h.call("dispatch", { role: "review", task: "검수" });
+			await h.finish(undefined, { finalOutput: "WORKFLOW_VERDICT: pass" });
+		}
+		await writeFile(join(h.repo, "file.txt"), "unapproved\n");
+		/* [When] */ const result =
+			action === "check" ? await h.call("check") : await h.call("dispatch", { role: action, task: "작업" });
+		/* [Then] */ expect(result.isError).toBe(true);
+		expect((await h.state()).phase).not.toBe("completed");
+	});
+	it("기존 커밋 전달로 계획을 바꾸면 승인과 검사 증거를 다시 요구한다", async () => {
+		/* [Given] */ const h = await harness();
+		await h.approve({ ...spec, endpoint: "pr" });
+		await h.call("check");
+		const version = (await h.state()).planVersion;
+		/* [When] */ await h.call("propose", { ...spec, endpoint: "pr", deliveryMode: "existing-commit" });
+		/* [Then] */ const state = await h.state();
+		expect(state.planVersion).not.toBe(version);
+		expect(state.phase).toBe("awaiting-approval");
+		expect(state.approval).toBeUndefined();
+		expect(state.verification).toBeUndefined();
+	});
+	it("승인 화면의 기존 커밋 SHA가 선택 전에 바뀌면 승인하지 않는다", async () => {
+		/* [Given] */ const h = await harness();
+		const head = git(h.repo, "rev-parse", "HEAD");
+		h.ctx.hasUI = true;
+		h.ctx.ui.select = async (prompt) => {
+			h.prompts.push(prompt);
+			git(h.repo, "commit", "--allow-empty", "-m", "화면 이후 변경");
+			return "승인";
+		};
+		await h.command("start 기존 커밋 전달");
+		/* [When] */ const result = await h.call("propose", { ...spec, endpoint: "pr", deliveryMode: "existing-commit" });
+		/* [Then] */ expect(result.isError).toBe(true);
+		expect(h.prompts[0]).toContain(head);
+		expect(h.prompts[0]).toMatch(/기존 커밋/);
+		expect(h.prompts[0]).toMatch(/새 커밋.*금지/);
+		expect((await h.state()).approval).toBeUndefined();
+	});
+	it("기존 커밋 검사 중 HEAD가 바뀌면 검사 증거를 남기지 않는다", async () => {
+		/* [Given] */ const h = await harness();
+		const marker = join(h.root, "check-entered");
+		const release = join(h.root, "check-release");
+		await h.approve({
+			...spec,
+			endpoint: "pr",
+			deliveryMode: "existing-commit",
+			checks: [`touch '${marker}'; while [ ! -e '${release}' ]; do sleep 0.01; done`],
+		});
+		const checking = h.call("check");
+		let result: Awaited<ReturnType<typeof h.call>>;
+		try {
+			await waitForFile(marker);
+			/* [When] */ git(h.repo, "commit", "--allow-empty", "-m", "검사 중 변경");
+		} finally {
+			await writeFile(release, "release");
+			result = await checking;
+		}
+		/* [Then] */ expect(result.isError).toBe(true);
+		expect((await h.state()).verification).toBeUndefined();
+	});
+	it("기존 커밋 검수 중 HEAD가 바뀌면 전달 가능한 증거를 남기지 않는다", async () => {
+		/* [Given] */ const h = await harness();
+		await h.approve({ ...spec, endpoint: "pr", deliveryMode: "existing-commit" });
+		await h.call("check");
+		await h.call("dispatch", { role: "review", task: "검수" });
+		git(h.repo, "commit", "--allow-empty", "-m", "검수 중 변경");
+		/* [When] */ await h.finish(undefined, { finalOutput: "WORKFLOW_VERDICT: pass" });
+		/* [Then] */ const state = await h.state();
+		expect(state.phase).not.toBe("ready-to-deliver");
+		expect(state.review).toBeUndefined();
+	});
+	it("기존 커밋도 필수 검수가 남으면 전달하지 않는다", async () => {
+		/* [Given] */ const h = await harness();
+		await h.approve({
+			...spec,
+			endpoint: "pr",
+			deliveryMode: "existing-commit",
+			requiredReviews: ["code", "security"],
+		});
+		await h.call("check");
+		await h.call("dispatch", { role: "review", reviewKey: "code", task: "코드 검수" });
+		await h.finish(undefined, { finalOutput: "WORKFLOW_VERDICT: pass" });
+		/* [When] */ const result = await h.call("dispatch", { role: "deliver", task: "전달" });
+		/* [Then] */ expect(result.isError).toBe(true);
+		expect((await h.state()).phase).toBe("reviewing");
+	});
+	it.each(["remote", "PR", "base"])("기존 커밋의 %s가 맞지 않으면 전달을 완료하지 않는다", async (boundary) => {
+		/* [Given] */ const h = await existingCommitReady();
+		const fake = await fakeRemote(h);
+		await h.call("dispatch", { role: "deliver", task: "전달" });
+		git(h.repo, "push", "origin", `${boundary === "remote" ? "HEAD~1" : "HEAD"}:refs/heads/feature/workflow`);
+		if (boundary !== "PR") await fake.openPr(boundary === "base" ? { baseRefName: "main" } : {});
+		/* [When] */ await fake.withGh(() => h.finish());
+		/* [Then] */ expect((await h.state()).control).toBe("blocked");
+		expect((await h.state()).phase).not.toBe("completed");
+		expect(git(h.repo, "rev-list", "--count", "HEAD")).toBe("2");
+	});
+	it.each(["head", "dirty"])("기존 커밋 전달 조회 중 %s가 바뀌면 완료하지 않는다", async (change) => {
+		/* [Given] */ const h = await existingCommitReady();
+		const fake = await fakeRemote(h);
+		await h.call("dispatch", { role: "deliver", task: "전달" });
+		git(h.repo, "push", "origin", "feature/workflow");
+		await fake.openPr();
+		const gate = await fake.gate();
+		await fake.withGh(async () => {
+			await h.finish(undefined, {}, false);
+			try {
+				await gate.entered();
+				/* [When] */ if (change === "head") git(h.repo, "commit", "--allow-empty", "-m", "조회 중 변경");
+				else await writeFile(join(h.repo, "file.txt"), "changed during query\n");
+			} finally {
+				await gate.release();
+			}
+			/* [Then] */ await expect.poll(async () => (await h.state()).control).toBe("blocked");
+		});
+		expect((await h.state()).phase).not.toBe("completed");
+	});
+	it("기존 커밋 전달 worker 실패는 자동 완료하지 않고 재개로 실제 결과를 확인한다", async () => {
+		/* [Given] */ const h = await existingCommitReady();
+		const fake = await fakeRemote(h);
+		await h.call("dispatch", { role: "deliver", task: "전달" });
+		git(h.repo, "push", "origin", "feature/workflow");
+		await fake.openPr();
+		await fake.withGh(() => h.finish(undefined, { status: "failed", exitCode: 1 }));
+		const blocked = await h.state();
+		/* [When] */ await fake.withGh(() => h.command("resume"));
+		/* [Then] */ expect(blocked.control).toBe("blocked");
+		expect(blocked.phase).not.toBe("completed");
+		expect((await h.state()).phase).toBe("completed");
+		expect(git(h.repo, "rev-list", "--count", "HEAD")).toBe("2");
+	});
+	it("재시작 후 기존 커밋 전달을 조정해 중복 worker 없이 완료한다", async () => {
+		/* [Given] */ const h = await existingCommitReady();
+		const fake = await fakeRemote(h);
+		await h.call("dispatch", { role: "deliver", task: "전달" });
+		await fake.withGh(() => h.finish());
+		git(h.repo, "push", "origin", "feature/workflow");
+		await fake.openPr();
+		const next = await harness(true, h);
+		await next.hook("session_start", {});
+		/* [When] */ await fake.withGh(() => next.command("resume"));
+		/* [Then] */ const state = await next.state();
+		expect(state.phase).toBe("completed");
+		expect(state.spec.deliveryMode).toBe("existing-commit");
+		expect(state.deliveries.filter((d: any) => d.action === "commit")).toHaveLength(1);
+		expect(state.deliveries.filter((d: any) => d.action === "pr")).toHaveLength(1);
+		expect(next.started).toHaveLength(0);
+		expect(git(h.repo, "rev-list", "--count", "HEAD")).toBe("2");
+		expect((await next.call("dispatch", { role: "deliver", task: "중복 전달" })).isError).toBe(true);
+	});
+});
+
+describe("기존 커밋 전달 승인과 복원 경계", () => {
+	it("기존 커밋 SHA를 보여준 화면에서 같은 커밋을 승인한다", async () => {
+		/* [Given] */ const h = await harness();
+		h.select("승인");
+		const head = git(h.repo, "rev-parse", "HEAD");
+		/* [When] */ await h.start({ ...spec, endpoint: "pr", deliveryMode: "existing-commit" });
+		/* [Then] */ const state = await h.state();
+		expect(h.prompts[0]).toContain(head);
+		expect(state.approval).toMatchObject({ via: "ui", head });
+		expect(state.phase).toBe("executing");
+	});
+	it("자동 승인도 현재 기존 커밋 SHA를 고정한다", async () => {
+		/* [Given] */ const h = await harness();
+		await h.command("start --auto 기존 커밋 전달");
+		const head = git(h.repo, "rev-parse", "HEAD");
+		/* [When] */ await h.call("propose", { ...spec, endpoint: "pr", deliveryMode: "existing-commit" });
+		/* [Then] */ expect((await h.state()).approval).toMatchObject({ via: "auto", head });
+	});
+	it.each(["verify", "commit"])("저장된 기존 커밋 모드의 %s 종료 지점도 복원하지 않는다", async (endpoint) => {
+		/* [Given] */ const h = await existingCommitReady();
+		const stored = await h.state();
+		stored.spec.endpoint = endpoint;
+		stored.planVersion = planVersion(stored.spec);
+		stored.approval.planVersion = stored.planVersion;
+		await writeFile(storedPath(h), JSON.stringify(stored));
+		const next = await harness(true, h);
+		/* [When] */ await next.hook("session_start", {});
+		/* [Then] */ expect((await next.state()).error).toMatch(/정본.*손상/);
+		expect(next.started).toHaveLength(0);
+	});
+	it.each(["pause", "cancel"])("기존 커밋 PR 조회 중 사용자 %s는 늦은 완료 결과보다 우선한다", async (command) => {
+		/* [Given] */ const h = await existingCommitReady();
+		const fake = await fakeRemote(h);
+		await h.call("dispatch", { role: "deliver", task: "전달" });
+		git(h.repo, "push", "origin", "feature/workflow");
+		await fake.openPr();
+		const gate = await fake.gate();
+		await fake.withGh(async () => {
+			await h.finish(undefined, {}, false);
+			try {
+				await gate.entered();
+				/* [When] */ await h.command(command);
+			} finally {
+				await gate.release();
+			}
+			/* [Then] */ await expect
+				.poll(async () => (await h.state()).control)
+				.toBe(command === "pause" ? "paused" : "cancelled");
+		});
+		const state = await h.state();
+		expect(state.phase).not.toBe("completed");
+		expect(state.userHold).toBe(true);
+		expect(state.deliveries).toHaveLength(0);
+	});
 });

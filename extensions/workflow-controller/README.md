@@ -10,8 +10,8 @@ Pi 메인이 판단과 분담을 맡고, 이 확장은 승인·상태·검사 �
 - `/workflow status|pause|resume|cancel`로 제어한다. 검사 중단은 독립 프로세스 그룹 전체에 SIGTERM을 보내고 기본 2초 뒤 SIGKILL로 강제 종료한다. 그룹 소멸과 child의 close 확인 전에는 stopping을 유지해 재개·dispatch를 거절한다. 검사 타임아웃(기본 10분)도 같은 절차로 일시정지한다. 취소는 파일 rollback이 아니며 세션 재시작은 자동 재개하지 않는다.
 - 검사 통과마다 새 `verification.id`를 만들고 review attempt에 연결한다. 증거를 무효화하거나 재검사할 때 실행 중인 이전 review도 무효로 표시한다. 이전 review의 늦은 판정은 기록만 남기고, 새 세대와 시작·종료 지문이 모두 일치하는 판정만 반영한다. 세대 없는 기존 정본의 증거는 무효화해 재검사를 요구한다.
 - 실패·중단된 구현은 `workflow_recover`로 실제 HEAD·작업 트리 지문·Git 상태를 확인해야 다시 실행할 수 있다.
-- endpoint `verify`는 검수 통과로 종료한다. `commit`·`pr`은 검수 통과(`ready-to-deliver`) 뒤 메인이 `workflow_dispatch`에 `role: "deliver"`로 전달 worker(기본 agent `worker`, `--main`)를 실행한다. worker는 commit 스킬을 읽고 검수된 내용만 hook을 유지해 커밋하며, `pr`이면 pr 스킬을 읽고 push와 Draft PR까지 전달한다. 파일 내용 수정·merge·배포·force push·amend·rebase·reset은 하지 않는다.
-- 전달 worker가 끝나면 확장은 승인 시점 커밋 위에 새 커밋이 쌓였는지(여러 개 허용), 최종 커밋 트리가 검수 지문과 같은지, 남은 변경이 없는지, 현재 브랜치가 승인 브랜치인지 확인한다. `pr`이면 원격 브랜치 head가 최종 커밋인지, 열린 Draft PR이 하나이고 그 head가 최종 커밋이며 base가 승인된 base인지도 확인한다. 실제 상태가 일치해야 완료로 기록한다.
+- endpoint `verify`는 검수 통과로 종료한다. 기본 새 커밋 전달에서 `commit`·`pr`은 검수 통과(`ready-to-deliver`) 뒤 메인이 `workflow_dispatch`에 `role: "deliver"`로 전달 worker(기본 agent `worker`, `--main`)를 실행한다. worker는 commit 스킬을 읽고 검수된 내용만 hook을 유지해 커밋하며, `pr`이면 pr 스킬을 읽고 push와 Draft PR까지 전달한다. 파일 내용 수정·merge·배포·force push·amend·rebase·reset은 하지 않는다.
+- 기본 전달 worker가 끝나면 확장은 승인 시점 커밋 위에 새 커밋이 쌓였는지(여러 개 허용), 최종 커밋 트리가 검수 지문과 같은지, 남은 변경이 없는지, 현재 브랜치가 승인 브랜치인지 확인한다. `pr`이면 원격 브랜치 head가 최종 커밋인지, 열린 Draft PR이 하나이고 그 head가 최종 커밋이며 base가 승인된 base인지도 확인한다. 실제 상태가 일치해야 완료로 기록한다.
 - 확인 실패 시 완료하지 않고 `blocked`로 멈춘다. 커밋만 완료되고 PR이 실패하면 커밋 완료를 기록한다. 재개 뒤 deliver를 다시 실행하면 worker는 이미 된 단계를 반복하지 않고 PR만 진행한다.
 
 정본은 `${agentDir}/workflows/<repoKey>/<workflowId>.json`이며 세션에는 참조만 저장한다. 손상·접근 오류는 fail-closed로 처리한다. 다른 살아 있는 프로세스가 소유하면 읽기 전용이다. 임시 index를 이용한 지문 계산은 실제 index와 작업 파일을 변경하지 않는다.
@@ -29,6 +29,24 @@ bunx --no-install biome check --error-on-warnings workflow-controller
 ```
 
 테스트는 실제 임시 Git 저장소·로컬 bare remote·실제 Pi 이벤트 버스와 subagent 관리 계약의 fake 응답자, PATH의 fake gh 실행 파일을 사용한다. 실제 subagent 구현·GitHub·사용자 설정을 변경하지 않는다.
+
+## 이미 만들어진 커밋의 전달
+
+이전 작업에서 커밋을 만들었고 push·PR만 남았다면, 일반 `workflow_propose` 계획에 아래 설정을 포함한다. `title`, `objective`, 검사·성공 기준 등 나머지 계획 필드도 필요하다.
+
+```json
+{
+  "endpoint": "pr",
+  "deliveryMode": "existing-commit",
+  "prBase": "stage"
+}
+```
+
+이 모드는 새 커밋을 만들지 않는다. 승인 화면에 기존 커밋 전달과 대상 SHA를 표시하고, 승인된 `approval.head`를 고정한다. 승인 화면 이후 SHA가 바뀌면 다시 확인해야 한다. 해당 workflow의 검사와 필수 독립 검수는 그대로 수행하며 이전 workflow의 승인·검증 증거를 복사하지 않는다.
+
+전달 worker는 pr 스킬을 읽고 고정된 커밋을 push한 뒤 Draft PR을 만들거나 재사용한다. 구현 worker, 파일 수정, 새 커밋·amend·rebase·force push는 허용하지 않는다. 확장은 승인 SHA·브랜치·깨끗한 작업 트리·검수된 커밋 트리와 실제 원격 head·Draft PR의 head/base를 확인한다. 기존 커밋을 확인한 기록은 `reused: true`로 구분하며, 원격이나 PR이 아직 준비되지 않았으면 완료하지 않는다. 조건을 충족한 뒤 재개하면 새 커밋 없이 전달을 확인할 수 있다.
+
+`deliveryMode`를 생략하면 기존 새 커밋 전달 규칙을 유지한다. `existing-commit`은 일반 모드의 `endpoint: "pr"` 전용이고, `verify`·`commit` 또는 stacked PR 생성용 옵션이 아니다. 모드를 바꾸는 것도 계획 변경이므로 재승인이 필요하다.
 
 ## Orchestrator 운영과 사용자 승인
 

@@ -1,5 +1,5 @@
 import { mustRun, run, snapshot } from "./io.ts";
-import type { Delivery, Workflow } from "./model.ts";
+import type { Delivery, Snapshot, Workflow } from "./model.ts";
 
 type PR = { url: string; isDraft: boolean; baseRefName: string; headRefName: string; headRefOid: string };
 export type DeliveryResult = { complete: true } | { complete: false; reason: string };
@@ -47,6 +47,19 @@ function record(state: Workflow, action: Delivery["action"], details: Record<str
 	else state.deliveries.push({ action, state: "done", at, details });
 }
 
+function assertExistingCommit(state: Workflow, current: Snapshot, tree: string): void {
+	if (state.mode === "stack" || state.spec?.endpoint !== "pr")
+		throw new Error("기존 커밋 전달은 일반 pr 종료 지점 전용입니다.");
+	if (
+		current.head !== state.approval?.head ||
+		tree !== state.approval.fingerprint ||
+		!state.verification?.id ||
+		state.verification.fingerprint !== tree ||
+		!(state.spec.requiredReviews ?? ["code"]).every((key) => state.reviewResults?.[key]?.fingerprint === tree)
+	)
+		throw new Error("기존 커밋이 승인된 HEAD·검사·필수 검수 증거와 다릅니다.");
+}
+
 /* 전달 worker의 보고 대신 실제 커밋·원격·PR 상태로 전달 여부를 판정한다. 승인과 어긋나면 예외를 던진다. */
 export async function inspectDelivery(state: Workflow, at: string): Promise<DeliveryResult> {
 	const approval = state.approval;
@@ -54,20 +67,24 @@ export async function inspectDelivery(state: Workflow, at: string): Promise<Deli
 		throw new Error("승인된 전달 종료 지점이 아닙니다.");
 	const current = await snapshot(state.repoRoot);
 	if (current.branch !== approval.branch) throw new Error("승인된 브랜치가 아닙니다.");
-	if (current.head === approval.head) return { complete: false, reason: "전달 커밋이 없습니다." };
-	const ancestor = await run(state.repoRoot, "git", ["merge-base", "--is-ancestor", approval.head, current.head]);
-	const merges =
-		ancestor.code === 0 ? await mustRun(state.repoRoot, "git", ["rev-list", "--merges", `${approval.head}..HEAD`]) : "";
+	const reused = state.spec.deliveryMode === "existing-commit";
+
+	if (!reused && current.head === approval.head) return { complete: false, reason: "전달 커밋이 없습니다." };
 	const tree = await mustRun(state.repoRoot, "git", ["rev-parse", "HEAD^{tree}"]);
-	if (
-		ancestor.code !== 0 ||
-		merges ||
-		tree !== state.review?.fingerprint ||
-		current.fingerprint !== tree ||
-		current.statusShort
-	)
+	if (reused) {
+		assertExistingCommit(state, current, tree);
+	} else {
+		const ancestor = await run(state.repoRoot, "git", ["merge-base", "--is-ancestor", approval.head, current.head]);
+		const merges =
+			ancestor.code === 0
+				? await mustRun(state.repoRoot, "git", ["rev-list", "--merges", `${approval.head}..HEAD`])
+				: "";
+		if (ancestor.code !== 0 || merges)
+			throw new Error("전달 커밋이 승인 커밋 위의 검수 내용과 다르거나 커밋되지 않은 변경이 남았습니다.");
+	}
+	if (tree !== state.review?.fingerprint || current.fingerprint !== tree || current.statusShort)
 		throw new Error("전달 커밋이 승인 커밋 위의 검수 내용과 다르거나 커밋되지 않은 변경이 남았습니다.");
-	record(state, "commit", { head: current.head, base: approval.head }, at);
+	record(state, "commit", { head: current.head, base: approval.head, ...(reused ? { reused: true } : {}) }, at);
 	if (state.spec.endpoint === "commit") return { complete: true };
 	const remote = await mustRun(state.repoRoot, "git", ["ls-remote", "origin", `refs/heads/${current.branch}`]);
 	if (remote.split(/\s/)[0] !== current.head)
@@ -95,6 +112,16 @@ export async function inspectDelivery(state: Workflow, at: string): Promise<Deli
 		pr.headRefOid !== current.head
 	)
 		throw new Error("PR의 base·Draft·head가 승인·전달 커밋과 다릅니다.");
+	if (reused) {
+		const latest = await snapshot(state.repoRoot);
+		if (
+			latest.branch !== current.branch ||
+			latest.head !== current.head ||
+			latest.fingerprint !== tree ||
+			latest.statusShort
+		)
+			throw new Error("전달 확인 도중 승인된 기존 커밋·작업 트리가 변경됐습니다.");
+	}
 	record(state, "pr", { head: current.head, url: pr.url, base: pr.baseRefName }, at);
 	return { complete: true };
 }

@@ -426,6 +426,8 @@ function validWorkflow(value: unknown): value is Workflow {
 			? state.userHold === undefined && state.controlRevision === undefined
 			: typeof state.userHold === "boolean" && state.controlRevision !== undefined) &&
 		validStack(state) &&
+		(!state.spec?.deliveryMode || (state.mode !== "stack" && state.spec.endpoint === "pr")) &&
+		(state.stack?.results.every((result) => !result.execution.spec?.deliveryMode) ?? true) &&
 		spec &&
 		approval &&
 		attempts &&

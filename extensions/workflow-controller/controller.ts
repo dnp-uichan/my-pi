@@ -42,6 +42,7 @@ import {
 	type Options,
 	type Owner,
 	type Role,
+	type Spec,
 	type Workflow,
 } from "./model.ts";
 
@@ -161,6 +162,19 @@ export class WorkflowController {
 		if (!state.approval || state.approval.planVersion !== state.planVersion)
 			throw new Error("사용자 승인이 필요합니다.");
 		const current = await snapshot(this.context?.cwd ?? state.repoRoot);
+		if (
+			state.spec?.deliveryMode === "existing-commit" &&
+			(current.repoRoot !== state.approval.repoRoot ||
+				current.branch !== state.approval.branch ||
+				current.head !== state.approval.head ||
+				current.statusShort ||
+				current.fingerprint !== state.approval.fingerprint)
+		) {
+			if (state.verification || state.review) await this.invalidateEvidence(state);
+			throw new Error(
+				"기존 커밋 전달은 승인된 HEAD·clean 작업 트리를 유지해야 합니다. 변경하려면 새 계획 승인이 필요합니다.",
+			);
+		}
 		if (current.repoRoot !== state.approval.repoRoot || current.branch !== state.approval.branch)
 			throw new Error("승인된 저장소·브랜치와 다릅니다.");
 		return current;
@@ -373,6 +387,7 @@ export class WorkflowController {
 		if (activeAttempts(state).length || this.checking || this.delivering)
 			throw new Error("실행 중 작업이 있어 계획을 바꿀 수 없습니다.");
 		const spec = normalizeSpec(input);
+		if (spec.deliveryMode && spec.endpoint !== "pr") throw new Error("기존 커밋 전달은 pr 종료 지점에서만 지정합니다.");
 		if (input.prBase !== undefined) {
 			if (spec.endpoint !== "pr") throw new Error("prBase는 pr 종료 지점에서만 지정합니다.");
 			if (input.prBase !== "stage" && protectedBranch(input.prBase))
@@ -401,13 +416,17 @@ export class WorkflowController {
 			});
 			return;
 		}
+		await this.requestApproval(state, spec, version);
+	}
+	private async requestApproval(state: Workflow, spec: Spec, version: string): Promise<void> {
 		if (this.context?.hasUI) {
+			const displayed = spec.deliveryMode === "existing-commit" ? await snapshot(state.repoRoot) : undefined;
 			const choice = await this.context.ui.select(
-				`${spec.title}\n${spec.objective}\n검사: ${spec.checks.join("; ")}\n종료: ${spec.endpoint === "pr" ? `Draft PR (base ${spec.prBase})` : spec.endpoint}`,
+				`${spec.title}\n${spec.objective}\n검사: ${spec.checks.join("; ")}\n종료: ${spec.endpoint === "pr" ? `Draft PR (base ${spec.prBase})` : spec.endpoint}${displayed ? `\n기존 커밋 전달: ${displayed.head} (${displayed.branch}), 새 커밋 생성 금지` : ""}`,
 				["승인", "보류"],
 				{ timeout: 60_000 },
 			);
-			if (choice === "승인") await this.approve("ui");
+			if (choice === "승인") await this.approve("ui", displayed ? { version, snapshot: displayed } : undefined);
 		}
 	}
 	async proposeStack(input: unknown): Promise<void> {
@@ -489,12 +508,25 @@ export class WorkflowController {
 			});
 		}
 	}
-	private async approve(via: "ui" | "command" | "auto"): Promise<void> {
+	private async approve(
+		via: "ui" | "command" | "auto",
+		displayed?: { version: string; snapshot: Awaited<ReturnType<typeof snapshot>> },
+	): Promise<void> {
 		const state = this.running();
 		if (state.phase !== "awaiting-approval" || !state.spec || !state.planVersion)
 			throw new Error("승인 대기 중인 계획이 없습니다.");
 		const current = await snapshot(this.context?.cwd ?? state.repoRoot);
 		if (current.repoRoot !== state.repoRoot) throw new Error("계획 저장소와 다릅니다.");
+		if (
+			displayed &&
+			(displayed.version !== state.planVersion ||
+				current.head !== displayed.snapshot.head ||
+				current.branch !== displayed.snapshot.branch ||
+				current.fingerprint !== displayed.snapshot.fingerprint)
+		)
+			throw new Error(
+				"승인 화면 이후 계획·브랜치·HEAD가 변경되었습니다. 새 승인 화면 또는 /workflow approve로 다시 승인하세요.",
+			);
 		if (state.spec.endpoint !== "verify" && current.statusShort)
 			throw new Error("commit/pr 승인에는 clean 작업 트리가 필요합니다.");
 		if (state.spec.endpoint === "pr" && protectedBranch(current.branch))
@@ -566,6 +598,8 @@ export class WorkflowController {
 	): Promise<void> {
 		if (role === "prepare") return;
 		if (role === "implement") {
+			if (state.spec?.deliveryMode === "existing-commit")
+				throw new Error("기존 커밋 전달 모드에서는 구현 worker를 허용하지 않습니다.");
 			if (state.phase !== "executing" || activeAttempts(state).some((a) => a.role === "implement"))
 				throw new Error("구현은 executing에서 한 번에 하나만 실행합니다.");
 			if (
@@ -669,7 +703,13 @@ export class WorkflowController {
 					? `${input.task}\n${prepareTask(state)}`
 					: `${input.task}${reviewKey ? `\n검수 관점: ${reviewKey}` : ""}`,
 				input.role === "deliver" && state.spec?.endpoint !== "verify" && state.spec
-					? { endpoint: state.spec.endpoint, base: prBase(state), branch: current.branch, head: current.head }
+					? {
+							endpoint: state.spec.endpoint,
+							base: prBase(state),
+							branch: current.branch,
+							head: current.head,
+							deliveryMode: state.spec.deliveryMode,
+						}
 					: undefined,
 			),
 			generation: state.owner.generation,
@@ -745,6 +785,7 @@ export class WorkflowController {
 		attempt.exitCode = event.exitCode;
 		attempt.stopReason = event.stopReason;
 		attempt.fingerprintAtFinish = await fingerprint(state.repoRoot);
+		await this.validateExistingAttempt(state, attempt);
 		if (attempt.role === "review") {
 			/* 현재 증거의 파일 변경은 판정과 별개로 무효화한다. 오래된 리뷰는 새 증거를 건드리지 않는다. */
 			if (
@@ -757,8 +798,10 @@ export class WorkflowController {
 			)
 				await this.invalidateEvidence(state);
 			attempt.verdict = verdict(event.finalOutput);
+
 			if (state.control === "running") this.reviewFinished(state, attempt);
 		}
+
 		await this.settleStop();
 		await this.persist("finished");
 		const kind =
@@ -772,6 +815,24 @@ export class WorkflowController {
 		if (kind && state.control === "running") {
 			this.delivering = true;
 			return { state, observed: structuredClone(state), kind };
+		}
+	}
+	private async validateExistingAttempt(state: Workflow, attempt: Attempt): Promise<void> {
+		if (state.control !== "running" || state.spec?.deliveryMode !== "existing-commit") return;
+		if (attempt.role === "review") {
+			try {
+				await this.approved(state);
+			} catch (error) {
+				attempt.reviewInvalidated = true;
+				state.control = "blocked";
+				state.controlSource = "system";
+				state.reason = String(error);
+			}
+		}
+		if (attempt.role === "deliver" && attempt.status !== "completed") {
+			state.control = "blocked";
+			state.controlSource = "system";
+			state.reason = "기존 커밋 전달 worker 실패: 실제 원격·PR 결과를 재개로 확인하세요.";
 		}
 	}
 	private ownsInspection({ state, observed }: DeliveryInspection): boolean {
@@ -804,6 +865,14 @@ export class WorkflowController {
 		await this.serial(async () => {
 			this.delivering = false;
 			if (this.ownsInspection(inspection) && state.control === "running") {
+				if (state.spec?.deliveryMode === "existing-commit") {
+					try {
+						await this.approved(state);
+					} catch (error) {
+						result = undefined;
+						reason = `전달 확인 실패: ${String(error)}`;
+					}
+				}
 				state.deliveries = observed.deliveries;
 				state.stack = observed.stack;
 				if (result?.complete && (inspection.kind === "prepare" || evidenceValid(state)))
@@ -1189,6 +1258,7 @@ export class WorkflowController {
 			await this.serial(async () => {
 				if (signal?.aborted || !this.ownsInspection(inspection) || !["paused", "blocked"].includes(state.control))
 					throw new Error("재개 도중 상태가 변경되었습니다.");
+				if (result?.complete && state.spec?.deliveryMode === "existing-commit") await this.approved(state);
 				state.deliveries = observed.deliveries;
 				state.stack = observed.stack;
 				if (result?.complete) {
