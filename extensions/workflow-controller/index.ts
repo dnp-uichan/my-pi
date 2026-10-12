@@ -1,5 +1,4 @@
-import { homedir } from "node:os";
-import { join } from "node:path";
+import { stackPlanSchema } from "./stack-model.ts";
 import {
 	getAgentDir,
 	type ExtensionAPI,
@@ -14,8 +13,6 @@ export function createWorkflowController(options: Options) {
 	return (pi: ExtensionAPI): void => {
 		const controller = new WorkflowController(pi, {
 			...options,
-			scriptsDir: options.scriptsDir ?? join(homedir(), ".claude", "scripts"),
-			prPolicy: options.prPolicy ?? { requiredBase: "stage", requiredReviewer: "dnp-sungbaek" },
 		});
 		function tool<T extends TSchema>(
 			name: string,
@@ -57,16 +54,32 @@ export function createWorkflowController(options: Options) {
 		tool("status", "워크플로 정본 상태·증거를 조회한다.", Type.Object({}), async () => controller.status());
 		tool(
 			"propose",
-			"계획과 검사·종료 지점을 제안한다. 승인은 사용자 명령 또는 실제 UI 선택만 허용한다.",
+			"계획과 검사·종료 지점을 제안한다. 승인은 사용자 명령·실제 UI 선택, 또는 사용자가 /workflow start --auto로 시작한 경우의 자동 승인만 허용한다.",
 			specSchema,
 			async (params) => controller.propose(params),
 		);
 		tool(
+			"stack_propose",
+			"명시적 --stack 모드의 전체 PR 계획·검수·CI를 제안한다. 승인 전 쓰기 금지.",
+			stackPlanSchema,
+			async (params) => controller.proposeStack(params),
+			false,
+		);
+		tool(
 			"dispatch",
-			"승인된 범위의 구현·독립 검수·읽기 전용 조사를 관리형 subagent로 실행한다.",
+			"승인된 범위의 구현·독립 검수·읽기 전용 조사, 검수 통과 뒤 commit·pr 스킬 기반 전달을 관리형 subagent로 실행한다.",
 			Type.Object({
-				role: Type.Union([Type.Literal("implement"), Type.Literal("review"), Type.Literal("research")]),
+				role: Type.Union([
+					Type.Literal("implement"),
+					Type.Literal("review"),
+					Type.Literal("research"),
+					Type.Literal("deliver"),
+					Type.Literal("prepare"),
+				]),
 				task: Type.String({ minLength: 1 }),
+				reviewKey: Type.Optional(
+					Type.String({ minLength: 1, description: "계획의 필수 검수 이름. 복수 검수이면 반드시 지정한다." }),
+				),
 				agent: Type.Optional(Type.String()),
 				contextMode: Type.Optional(Type.Union([Type.Literal("main"), Type.Literal("isolated")])),
 				thinking: Type.Optional(
@@ -102,18 +115,8 @@ export function createWorkflowController(options: Options) {
 			Type.Object({ reason: Type.String({ minLength: 1 }) }),
 			async (params) => controller.block(params.reason),
 		);
-		tool(
-			"deliver",
-			"검수된 내용만 승인된 commit 또는 PR 종료 지점까지 전달한다. merge·배포 금지.",
-			Type.Union([
-				Type.Object({ action: Type.Literal("commit"), message: Type.String({ minLength: 1 }) }),
-				Type.Object({ action: Type.Literal("pr"), title: Type.String({ minLength: 1 }), body: Type.String() }),
-			]),
-			async (params, _ctx, signal) => controller.deliver(params, signal),
-			false,
-		);
 		pi.registerCommand("workflow", {
-			description: "관리형 워크플로 start/status/approve/pause/resume/cancel",
+			description: "관리형 워크플로 start [--stack] [--auto]/status/approve/pause/resume/cancel",
 			handler: (args, ctx) => controller.command(args, ctx),
 		});
 		pi.on("session_start", (_event, ctx) => controller.sessionStart(ctx));

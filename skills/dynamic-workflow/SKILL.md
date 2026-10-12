@@ -201,7 +201,7 @@ P0/P1, 필수 gate 실패·실행 불가 또는 다른 blocker가 남으면 다�
 - 적용할 이유가 없는 단계는 근거와 대체 검증을 기록한다. 필요한 테스트·검수와 프로젝트 필수 검사는 생략하지 않는다. 현재 호출에서 선택한 추가 제약이 있으면 함께 적용한다.
 - 테스트 작성의 증거: 의도한 Red, 기존 동작 회귀 테스트의 통과, 구현 미존재로 인한 실행 불가를 구분한다. 구현 미존재 항목은 Green 단계에서 실제 동작 검증을 확인한다. 러너·환경 오류는 Red 통과가 아니다.
 - 개선: 확인된 리뷰 지적만 승인 범위에서 수정한다. `implement`의 테스트 보호 규칙을 재사용하고 수정 후 검증과 독립적인 해결 확인을 한다. 지적이 없으면 변경 없이 통과한다.
-- 권한: 실행 옵션 자체는 commit·push·PR 권한이 아니다. 개발 요청만 있으면 개선·재검증까지 진행하고, 명시한 종료 지점과 금지사항을 따른다. PR까지 허용됐으면 필요한 commit·push·PR 승인을 반복하지 않는다. merge·배포로 확장하지 않는다.
+- 권한: 실행 옵션 자체는 commit·push·PR 권한이 아니다. 개발 요청만 있으면 개선·재검증까지 진행하고, 명시한 종료 지점과 금지사항을 따른다. PR까지 허용됐으면 필요한 commit·push·PR 승인을 반복하지 않는다. commit·push·PR은 관리 모드가 아니거나 관리 모드 전달 경로를 쓸 수 없을 때도 메인이 직접 실행하지 않고 commit·pr 스킬을 읽는 worker에게 위임한다. merge·배포로 확장하지 않는다.
 
 스킬은 각 단계의 기준만 담당한다. `stress-interview`, `self-healing`, `simplify`는 사용자가 별도로 선택한 경우에만 연결하며 기본 흐름에 추가하지 않는다.
 
@@ -209,11 +209,11 @@ P0/P1, 필수 gate 실패·실행 불가 또는 다른 blocker가 남으면 다�
 
 사용자가 `/workflow start <목표>`로 시작한 작업에서는 `workflow-controller` 확장이 승인·진행 상태·검증 증거·중단·전달을 기록하고 다음 단계 조건을 판정한다. 계획과 분담은 계속 메인이 맡는다. 관리용 subagent API가 없으면 시작이 거절되며 지침만으로 대신 진행하지 않는다.
 
-- 읽기 전용 조사 뒤 `workflow_propose`로 목표·제외 범위·완료 조건·검사 명령·종료 지점·개선 한도를 제안한다. 승인은 사용자 선택이나 `/workflow approve`로만 성립한다.
-- 구현·검수·조사 worker는 `workflow_dispatch`로 실행한다. 모델은 agent 설정을 유지하고, effort는 작업 난이도로 판단해 `thinking`에 지정한다. 단순 수정은 `low`, 일반 구현은 `medium`·`high`, 설계가 얽히거나 검수가 까다로운 변경은 `xhigh`이며 생략하면 agent 기본값이다. 이 모드에서는 관리되지 않는 `subagent` 실행과 직접 `git commit`·`git push`·`gh pr create` 같은 명령을 확장이 막는다. 가드는 OS 수준 격리가 아니다.
+- 읽기 전용 조사 뒤 `workflow_propose`로 목표·제외 범위·완료 조건·검사 명령·종료 지점·개선 한도를 제안한다. `endpoint: "pr"`일 때만 선택 필드 `prBase`로 stacked PR의 base를 지정할 수 있으며 기본은 `stage`다. stacked base는 보호 브랜치(`main`, `master`, `stage`, `development`, `production`)가 아닌 기존 원격 브랜치여야 하며 승인 화면에 표시된다. 승인은 사용자 선택이나 `/workflow approve`로만 성립한다.
+- 구현·검수·조사 worker는 `workflow_dispatch`로 실행한다. 모델은 agent 설정을 유지하고, effort는 작업 난이도로 판단해 `thinking`에 지정한다. 단순 수정은 `low`, 일반 구현은 `medium`·`high`, 설계가 얽히거나 검수가 까다로운 변경은 `xhigh`이며 생략하면 agent 기본값이다. 이 모드에서는 메인 세션의 관리되지 않는 `subagent` 실행과 직접 `git commit`·`git push`·`gh pr create` 같은 명령을 확장이 막는다. 가드는 OS 수준 격리가 아니다.
 - 구현 worker의 완료 보고는 완료가 아니다. `workflow_check`의 검사 통과와, 구현 agent와 다른 reviewer의 `WORKFLOW_VERDICT: pass`가 같은 작업 트리 지문에 묶여야 다음 단계로 간다.
 - 실패하거나 중단된 구현은 `workflow_recover`로 실제 작업 공간 상태를 기록한 뒤 다시 실행한다. 사용자 판단이 필요하면 `workflow_block`으로 멈추고 질문한다.
-- 전달은 승인한 종료 지점까지만 `workflow_deliver`로 수행한다. merge·배포는 하지 않는다.
+- 검수 통과(`ready-to-deliver`) 뒤 `workflow_dispatch`에 `role: "deliver"`로 전달 worker(기본 agent `worker`, `--main`)를 실행한다. `thinking`은 메인이 정한다. worker는 commit 스킬을 읽고 커밋하며, 종료 지점이 `pr`이면 pr 스킬을 읽고 push와 Draft PR까지 전달한다. 확장은 실제 커밋·원격·PR 상태를 확인한 뒤에만 완료로 기록하며 확인 실패 시 `blocked`로 멈춘다. 커밋만 완료되고 PR이 실패하면 커밋 완료를 기록하고, 재개 뒤 deliver를 다시 실행할 때 이미 된 단계는 반복하지 않는다. 전달 worker는 파일 내용 수정·merge·배포·force push·amend·rebase·reset을 하지 않는다. 구현 worker의 commit·push·PR 금지는 유지한다.
 - `/workflow status|pause|resume|cancel`로 확인·중지·재개한다. Esc도 일시정지로 처리하며 재시작이나 취소 뒤 자동 재개하지 않는다.
 - 완료·정지 기준은 `references/omo-managed-contract.md`를 따른다. 이 발췌문은 SUL-1.0 대상이다.
 

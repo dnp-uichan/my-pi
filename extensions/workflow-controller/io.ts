@@ -1,3 +1,5 @@
+import { stackPlanSchema } from "./stack-model.ts";
+import { stackVersion } from "./stack-state.ts";
 import { execFile, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { copyFile, mkdir, mkdtemp, readFile, realpath, rename, rm, writeFile } from "node:fs/promises";
@@ -192,7 +194,7 @@ const text = Type.String();
 const snapshotSchema = Type.Object({ repoRoot: text, branch: text, head: text, fingerprint: text, statusShort: text });
 const attemptSchema = Type.Object({
 	id: Type.String({ pattern: "^[a-f0-9-]{36}$" }),
-	role: choices(["implement", "review", "research"]),
+	role: choices(["implement", "review", "research", "deliver", "prepare"]),
 	agent: text,
 	contextMode: choices(["main", "isolated"]),
 	thinking: Type.Optional(choices(["low", "medium", "high", "xhigh"])),
@@ -203,6 +205,7 @@ const attemptSchema = Type.Object({
 	runId: Type.Optional(Type.Integer({ minimum: 1 })),
 	fingerprintAtDispatch: text,
 	verificationId: Type.Optional(Type.String({ minLength: 1 })),
+	reviewKey: Type.Optional(Type.String({ minLength: 1 })),
 	reviewInvalidated: Type.Optional(Type.Boolean()),
 	fingerprintAtFinish: Type.Optional(text),
 	finalOutput: Type.Optional(text),
@@ -220,11 +223,12 @@ const attemptSchema = Type.Object({
 		}),
 	),
 });
-const persistedSchema = Type.Object({
+const singleSchema = Type.Object({
 	workflowId: text,
 	repoKey: text,
 	repoRoot: text,
 	goal: text,
+	autoApprove: Type.Optional(Type.Literal(true)),
 	phase: choices(["drafting", "awaiting-approval", "executing", "reviewing", "ready-to-deliver", "completed"]),
 	control: choices(["running", "stopping", "paused", "blocked", "cancelled"]),
 	stopTarget: Type.Optional(choices(["paused", "cancelled"])),
@@ -242,7 +246,7 @@ const persistedSchema = Type.Object({
 		Type.Object({
 			planVersion: text,
 			at: text,
-			via: choices(["ui", "command"]),
+			via: choices(["ui", "command", "auto"]),
 			repoRoot: text,
 			branch: text,
 			head: text,
@@ -263,6 +267,7 @@ const persistedSchema = Type.Object({
 	),
 	verification: Type.Optional(Type.Object({ id: Type.Optional(Type.String({ minLength: 1 })), fingerprint: text })),
 	review: Type.Optional(Type.Object({ attemptId: text, fingerprint: text })),
+	reviewResults: Type.Optional(Type.Record(Type.String(), Type.Object({ attemptId: text, fingerprint: text }))),
 	deliveries: Type.Array(
 		Type.Object({
 			action: choices(["commit", "push", "pr"]),
@@ -284,10 +289,122 @@ const persistedSchema = Type.Object({
 	events: Type.Array(Type.Object({ seq: count, at: text, message: text }), { maxItems: 100 }),
 	resumeSnapshot: Type.Optional(snapshotSchema),
 });
+const unitExecutionSchema = Type.Pick(singleSchema, [
+	"spec",
+	"planVersion",
+	"approval",
+	"attempts",
+	"checks",
+	"verification",
+	"review",
+	"reviewResults",
+	"deliveries",
+	"improvementCycles",
+	"recoveries",
+]);
+const persistedSchema = Type.Object({
+	...singleSchema.properties,
+	mode: Type.Optional(Type.Literal("stack")),
+	stack: Type.Optional(
+		Type.Object({
+			plan: Type.Object({
+				...stackPlanSchema.properties,
+				maxImprovementCycles: Type.Integer({ minimum: 1, maximum: 5 }),
+				maxRecoveries: Type.Integer({ minimum: 0, maximum: 3 }),
+			}),
+			planVersion: text,
+			index: count,
+			stage: choices(["planned", "preparing", "unit", "integration"]),
+			approval: Type.Optional(
+				Type.Object({
+					at: text,
+					via: choices(["ui", "command", "auto"]),
+					rootHead: text,
+					rootFingerprint: text,
+					sourceBranch: text,
+					sourceHead: text,
+				}),
+			),
+			results: Type.Array(
+				Type.Object({
+					id: text,
+					branch: text,
+					base: text,
+					parentHead: text,
+					head: text,
+					fingerprint: text,
+					url: text,
+					valid: Type.Boolean(),
+					execution: unitExecutionSchema,
+				}),
+			),
+			invalidatedFrom: Type.Optional(count),
+		}),
+	),
+});
+function validStack(state: Workflow): boolean {
+	const stack = state.stack;
+	if (state.mode !== "stack") return !stack;
+	if (!stack) return state.phase === "drafting" && !state.spec && !state.approval;
+	if (
+		stack.planVersion !== stackVersion(stack.plan) ||
+		stack.index > stack.plan.units.length ||
+		stack.results.length !== stack.index
+	)
+		return false;
+	if (
+		new Set(stack.plan.units.map((unit) => unit.id)).size !== stack.plan.units.length ||
+		new Set(stack.plan.units.map((unit) => unit.branch)).size !== stack.plan.units.length
+	)
+		return false;
+	if (!stack.approval)
+		return stack.stage === "planned" && stack.index === 0 && state.phase === "awaiting-approval" && !state.approval;
+	if (stack.stage === "planned" || (stack.stage === "integration") !== (stack.index === stack.plan.units.length))
+		return false;
+	if (stack.invalidatedFrom !== undefined && stack.invalidatedFrom > stack.index) return false;
+	if (
+		!stack.results.every((result, index) => {
+			const unit = stack.plan.units[index];
+			const previous = stack.results[index - 1];
+			const execution = result.execution;
+			return (
+				result.id === unit.id &&
+				result.branch === unit.branch &&
+				result.base === (previous?.branch ?? stack.plan.rootBase) &&
+				result.parentHead === (previous?.head ?? stack.approval?.rootHead) &&
+				execution.spec &&
+				execution.planVersion === planVersion(execution.spec) &&
+				execution.approval?.planVersion === execution.planVersion &&
+				execution.approval.branch === result.branch &&
+				execution.approval.head === result.parentHead &&
+				!!execution.verification?.id &&
+				execution.verification.fingerprint === result.fingerprint &&
+				execution.review?.fingerprint === result.fingerprint &&
+				unit.requiredReviews.every((key) => execution.reviewResults?.[key]?.fingerprint === result.fingerprint)
+			);
+		})
+	)
+		return false;
+	const unit = stack.plan.units[stack.index];
+	const previous = stack.results.at(-1);
+	return (
+		!!state.spec &&
+		!!state.approval &&
+		state.approval.branch === (unit?.branch ?? previous?.branch) &&
+		state.approval.head === (previous?.head ?? stack.approval.rootHead) &&
+		state.spec.endpoint === (unit ? "pr" : "verify") &&
+		JSON.stringify(state.spec.checks) === JSON.stringify(unit?.checks ?? stack.plan.integrationChecks) &&
+		JSON.stringify(state.spec.requiredReviews) ===
+			JSON.stringify(unit?.requiredReviews ?? stack.plan.integrationReviews) &&
+		(!unit || state.spec.prBase === (previous?.branch ?? stack.plan.rootBase))
+	);
+}
 function validWorkflow(value: unknown): value is Workflow {
 	if (!Value.Check(persistedSchema, value)) return false;
 	const state = value as Workflow;
-	const spec = state.spec ? state.planVersion === planVersion(state.spec) : state.phase === "drafting";
+	const spec = state.spec
+		? state.planVersion === planVersion(state.spec)
+		: state.phase === "drafting" || (state.mode === "stack" && state.phase === "awaiting-approval");
 	const approval = state.approval
 		? state.approval.planVersion === state.planVersion && state.approval.repoRoot === state.repoRoot
 		: ["drafting", "awaiting-approval"].includes(state.phase);
@@ -295,6 +412,7 @@ function validWorkflow(value: unknown): value is Workflow {
 		new Set(state.attempts.map((a) => a.id)).size === state.attempts.length &&
 		state.attempts.every((a) => a.generation <= state.owner.generation);
 	return (
+		validStack(state) &&
 		spec &&
 		approval &&
 		attempts &&

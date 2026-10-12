@@ -1,3 +1,6 @@
+import type { StackState } from "./stack-model.ts";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import { createHash } from "node:crypto";
 import { Type, type Static } from "typebox";
 
@@ -9,11 +12,20 @@ export const specSchema = Type.Object({
 	checks: Type.Array(Type.String({ minLength: 1 }), { minItems: 1 }),
 	endpoint: Type.Union([Type.Literal("verify"), Type.Literal("commit"), Type.Literal("pr")]),
 	prDraft: Type.Optional(Type.Literal(true)),
+	requiredReviews: Type.Optional(
+		Type.Array(Type.String({ minLength: 1, pattern: "\\S" }), { minItems: 1, uniqueItems: true }),
+	),
+	prBase: Type.Optional(
+		Type.String({ minLength: 1, description: "stacked PR의 base 브랜치. pr 종료 지점에서만 지정하며 생략하면 stage." }),
+	),
 	maxImprovementCycles: Type.Optional(Type.Integer({ minimum: 1, maximum: 5 })),
 	maxRecoveries: Type.Optional(Type.Integer({ minimum: 0, maximum: 3 })),
 });
-export type Spec = Required<Static<typeof specSchema>>;
-export type Role = "implement" | "review" | "research";
+export type Spec = Omit<Required<Static<typeof specSchema>>, "prBase" | "requiredReviews"> & {
+	prBase?: string;
+	requiredReviews?: string[];
+};
+export type Role = "implement" | "review" | "research" | "deliver" | "prepare";
 /* 메인이 고를 수 있는 worker effort. off·minimal·max는 품질·비용 극단이라 제외한다. */
 export const DISPATCH_THINKING_LEVELS = ["low", "medium", "high", "xhigh"] as const;
 export type DispatchThinking = (typeof DISPATCH_THINKING_LEVELS)[number];
@@ -31,6 +43,7 @@ export type Attempt = {
 	runId?: number;
 	fingerprintAtDispatch: string;
 	verificationId?: string;
+	reviewKey?: string;
 	reviewInvalidated?: boolean;
 	fingerprintAtFinish?: string;
 	finalOutput?: string;
@@ -58,6 +71,9 @@ export type Workflow = {
 	repoKey: string;
 	repoRoot: string;
 	goal: string;
+	mode?: "stack";
+	stack?: StackState;
+	autoApprove?: boolean;
 	phase: "drafting" | "awaiting-approval" | "executing" | "reviewing" | "ready-to-deliver" | "completed";
 	control: "running" | "stopping" | "paused" | "blocked" | "cancelled";
 	stopTarget?: "paused" | "cancelled";
@@ -67,7 +83,7 @@ export type Workflow = {
 	approval?: {
 		planVersion: string;
 		at: string;
-		via: "ui" | "command";
+		via: "ui" | "command" | "auto";
 		repoRoot: string;
 		branch: string;
 		head: string;
@@ -85,6 +101,7 @@ export type Workflow = {
 	}[];
 	verification?: { id?: string; fingerprint: string };
 	review?: { attemptId: string; fingerprint: string };
+	reviewResults?: Record<string, { attemptId: string; fingerprint: string }>;
 	deliveries: Delivery[];
 	improvementCycles: number;
 	recoveries: number;
@@ -96,8 +113,6 @@ export type Workflow = {
 };
 export type Options = {
 	agentDir: string;
-	scriptsDir?: string;
-	prPolicy?: { requiredBase: string; requiredReviewer: string };
 	now?: () => Date;
 	stopTimeoutMs?: number;
 	checkKillGraceMs?: number;
@@ -113,6 +128,8 @@ export function normalizeSpec(input: Static<typeof specSchema>): Spec {
 		checks: input.checks.map((s) => s.trim()),
 		endpoint: input.endpoint,
 		prDraft: input.prDraft ?? true,
+		...(input.requiredReviews ? { requiredReviews: input.requiredReviews.map((key) => key.trim()) } : {}),
+		...(input.endpoint === "pr" ? { prBase: input.prBase ?? "stage" } : {}),
 		maxImprovementCycles: input.maxImprovementCycles ?? 3,
 		maxRecoveries: input.maxRecoveries ?? 2,
 	};
@@ -134,8 +151,29 @@ export const protectedBranch = (branch: string) =>
 export function boundOutput(output: string): string {
 	return output.length <= 8000 ? output : `${output.slice(0, 4000)}\n…\n${output.slice(-4000)}`;
 }
-export function roleTask(role: Role, task: string): string {
+export type DeliverContext = { endpoint: "commit" | "pr"; base: string; branch: string; head: string };
+export function evidenceValid(state: Workflow): boolean {
+	return (
+		!!state.review?.fingerprint &&
+		!!state.verification?.id &&
+		state.review.fingerprint === state.verification.fingerprint
+	);
+}
+function deliverContract(context: DeliverContext): string {
+	const skills = join(homedir(), ".claude", "skills");
+	const pr =
+		context.endpoint === "pr"
+			? ` 이어서 ${join(skills, "pr", "SKILL.md")}를 읽고 브랜치 ${context.branch}를 origin에 push한 뒤 base ${context.base}로 Draft PR을 만든다. 같은 head의 열린 PR이 있으면 새로 만들지 않는다.`
+			: " push·PR은 하지 않는다.";
+	return `검수 통과한 현재 작업 트리를 전달한다. ${join(skills, "commit", "SKILL.md")}를 읽고 그 기준으로 커밋한다.${pr} 커밋은 현재 HEAD ${context.head} 위에 쌓고 이미 끝난 단계는 반복하지 않는다. 파일 내용 수정·merge·배포·force push·amend·rebase·reset 금지. 마지막에 커밋 해시${context.endpoint === "pr" ? "와 PR URL" : ""}을 보고한다.`;
+}
+export function roleTask(role: Role, task: string, context?: DeliverContext): string {
+	if (role === "deliver") {
+		if (!context) throw new Error("전달 정보가 필요합니다.");
+		return `${task}\n\n역할 계약\n${deliverContract(context)}`;
+	}
 	const contracts = {
+		prepare: "승인된 스택 브랜치만 준비한다. 파일 수정·commit·push·merge·rebase·reset·배포 금지.",
 		implement:
 			"승인된 범위만 구현하고 테스트를 보호한다. commit/push/PR/merge/배포 금지. 변경 파일과 실제 검증 명령·결과를 보고한다.",
 		review:
@@ -173,6 +211,7 @@ export function guard(
 			["help", "runs", "status", "detail", "abort", "remove"].includes(verb ?? "");
 		if (!safeCommand && !canDispatch(command)) return "workflow_dispatch를 사용하세요.";
 	}
-	if (tool === "bash" && forbiddenBash(command)) return "workflow_deliver를 사용하세요. merge·배포는 금지입니다.";
+	if (tool === "bash" && forbiddenBash(command))
+		return "commit·push·PR은 workflow_dispatch role deliver로 전달 worker에게 맡기세요. merge·배포는 금지입니다.";
 	return undefined;
 }

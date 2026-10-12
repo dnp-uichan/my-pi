@@ -1,3 +1,14 @@
+import { stackPlanSchema } from "./stack-model.ts";
+import { activateStackUnit, advanceStack, normalizeStackPlan, stackInstruction, stackVersion } from "./stack-state.ts";
+import {
+	validateStackPlan,
+	readStackBase,
+	prepareTask,
+	inspectPreparation,
+	verifyStackDependencies,
+	verifyUnitCI,
+	inspectStackCompletion,
+} from "./stack.ts";
 import { randomUUID } from "node:crypto";
 import type {
 	AgentBeforeSettleEvent,
@@ -6,14 +17,15 @@ import type {
 	ExtensionToolContext,
 } from "@earendil-works/pi-coding-agent";
 import { Value } from "typebox/value";
-import { DeliveryService, type DeliveryInput } from "./delivery.ts";
-import { alive, fingerprint, load, runCheck, save, snapshot } from "./io.ts";
+import { deliveredHead, inspectDelivery, prBase, reconcileCommitIntents, type DeliveryResult } from "./delivery.ts";
+import { alive, fingerprint, load, mustRun, run, runCheck, save, snapshot } from "./io.ts";
 import {
 	activeAttempts,
 	boundOutput,
 	DISPATCH_THINKING_LEVELS,
 	type DispatchThinking,
 	dispatchCommand,
+	evidenceValid,
 	guard,
 	hash,
 	normalizeSpec,
@@ -32,7 +44,7 @@ import {
 	type Workflow,
 } from "./model.ts";
 
-export const toolNames = ["status", "propose", "dispatch", "check", "recover", "block", "deliver"].map(
+export const toolNames = ["status", "propose", "stack_propose", "dispatch", "check", "recover", "block"].map(
 	(name) => `workflow_${name}`,
 );
 type ManagedEvent =
@@ -62,16 +74,20 @@ export type DispatchInput = {
 	agent?: string;
 	contextMode?: "main" | "isolated";
 	thinking?: string;
+	reviewKey?: string;
 };
 type RecoverInput = { attemptId: string; assessment: "complete" | "partial" | "unknown"; notes: string };
+type DeliveryInspection = { state: Workflow; observed: Workflow; kind?: "prepare" | "deliver" | "stack" };
 
 function dispatchOptions(input: DispatchInput): {
 	agent: string;
 	mode: "main" | "isolated";
 	thinking?: DispatchThinking;
 } {
-	const agent = input.agent ?? { implement: "worker", review: "reviewer", research: "searcher" }[input.role];
-	const mode = input.contextMode ?? (input.role === "implement" ? "main" : "isolated");
+	const agent =
+		input.agent ??
+		{ implement: "worker", review: "reviewer", research: "searcher", deliver: "worker", prepare: "worker" }[input.role];
+	const mode = input.contextMode ?? (["implement", "deliver", "prepare"].includes(input.role) ? "main" : "isolated");
 	if (!/^[a-zA-Z0-9_][a-zA-Z0-9_-]*$/.test(agent) || !["main", "isolated"].includes(mode))
 		throw new Error("잘못된 agent·contextMode");
 	if (input.thinking !== undefined && !(DISPATCH_THINKING_LEVELS as readonly string[]).includes(input.thinking))
@@ -91,21 +107,12 @@ export class WorkflowController {
 	private delivering = false;
 	private checkAbort?: AbortController;
 	private unsubscribeInput?: () => void;
-	private delivery: DeliveryService;
 	private now: () => Date;
 	constructor(
 		private pi: ExtensionAPI,
-		private options: Options & { scriptsDir: string; prPolicy: { requiredBase: string; requiredReviewer: string } },
+		private options: Options,
 	) {
 		this.now = options.now ?? (() => new Date());
-		this.delivery = new DeliveryService(
-			{ scriptsDir: options.scriptsDir, prPolicy: options.prPolicy, now: this.now },
-			(state, message) =>
-				this.serial(async () => {
-					if (this.state !== state || this.fatal) throw new Error("전달 소유 상태가 변경되었습니다.");
-					await this.persist(message);
-				}),
-		);
 		pi.events.on("subagent:managed:v1:event", (raw) => this.managedEvent(raw));
 	}
 	serial<T>(operation: () => Promise<T>): Promise<T> {
@@ -151,11 +158,20 @@ export class WorkflowController {
 		const state = this.state;
 		const enabled = state && this.owned() && !this.fatal && !terminal(state);
 		const active = this.pi.getActiveTools().filter((name) => !toolNames.includes(name));
-		this.pi.setActiveTools(enabled ? [...active, ...toolNames] : active);
+		this.pi.setActiveTools(
+			enabled
+				? [
+						...active,
+						...toolNames.filter(
+							(name) => name !== (state.mode === "stack" ? "workflow_propose" : "workflow_stack_propose"),
+						),
+					]
+				: active,
+		);
 		this.context?.ui.setStatus(
 			"workflow",
 			state
-				? `${state.phase} · ${state.control} · 개선 ${state.improvementCycles}/${state.spec?.maxImprovementCycles ?? 3} · 복구 ${state.recoveries}/${state.spec?.maxRecoveries ?? 2}${this.readOnly ? " · 읽기 전용" : ""}${this.fatal ? ` · ${this.fatal}` : state.reason ? ` · ${state.reason}` : ""}`
+				? `${state.mode === "stack" ? `stack ${state.stack ? `${Math.min(state.stack.index + 1, state.stack.plan.units.length)}/${state.stack.plan.units.length} ${state.stack.stage}` : "계획"} · ` : ""}${state.phase} · ${state.control} · 개선 ${state.improvementCycles}/${state.spec?.maxImprovementCycles ?? 3} · 복구 ${state.recoveries}/${state.spec?.maxRecoveries ?? 2}${this.readOnly ? " · 읽기 전용" : ""}${this.fatal ? ` · ${this.fatal}` : state.reason ? ` · ${state.reason}` : ""}`
 				: this.fatal,
 		);
 	}
@@ -189,6 +205,10 @@ export class WorkflowController {
 	async command(args: string, ctx: ExtensionContext): Promise<void> {
 		this.context = ctx;
 		try {
+			if (args.trim() === "approve" && this.state?.mode === "stack") {
+				await this.approveStack("command");
+				return;
+			}
 			if (args.trim() === "resume") {
 				await this.resume();
 				return;
@@ -196,9 +216,18 @@ export class WorkflowController {
 			await this.serial(async () => {
 				const [sub, ...rest] = args.trim().split(/\s+/);
 				switch (sub) {
-					case "start":
-						await this.start(rest.join(" "));
+					case "start": {
+						let auto = false;
+						let stack = false;
+						while (rest[0]?.startsWith("--")) {
+							const flag = rest.shift();
+							if (flag === "--auto") auto = true;
+							else if (flag === "--stack") stack = true;
+							else throw new Error(`알 수 없는 workflow 옵션: ${flag}`);
+						}
+						await this.start(rest.join(" "), auto, stack);
 						break;
+					}
 					case "status":
 						this.display();
 						ctx.ui.notify(JSON.stringify(this.status(), null, 2), "info");
@@ -213,14 +242,14 @@ export class WorkflowController {
 						await this.stop("cancelled");
 						break;
 					default:
-						throw new Error("사용법: /workflow start <목표>|status|approve|pause|resume|cancel");
+						throw new Error("사용법: /workflow start [--stack] [--auto] <목표>|status|approve|pause|resume|cancel");
 				}
 			});
 		} catch (error) {
 			this.notify(String(error));
 		}
 	}
-	private async start(goal: string): Promise<void> {
+	private async start(goal: string, auto: boolean, stack = false): Promise<void> {
 		if (this.fatal || this.readOnly) throw new Error(this.fatal ?? "다른 프로세스 소유 워크플로입니다.");
 		if (this.state && !terminal(this.state)) throw new Error("세션당 비종료 워크플로는 하나입니다.");
 		if (!goal) throw new Error("목표가 필요합니다.");
@@ -238,6 +267,8 @@ export class WorkflowController {
 			repoKey: hash(current.repoRoot).slice(0, 16),
 			repoRoot: current.repoRoot,
 			goal,
+			...(stack ? { mode: "stack" as const } : {}),
+			...(auto ? { autoApprove: true as const } : {}),
 			phase: "drafting",
 			control: "running",
 			attempts: [],
@@ -262,7 +293,7 @@ export class WorkflowController {
 			repoRoot: this.state.repoRoot,
 		});
 		this.pi.sendUserMessage(
-			`목표: ${goal}\n읽기 전용으로 조사하고 workflow_propose로 계획·검사 명령·종료 지점을 제안하세요. 사용자 승인 전에는 구현하지 마세요. 승인 후에는 workflow_dispatch로 작업·독립 검수를 분담하고 workflow_check로 검증하세요. 직접 commit/push/PR/merge/배포 금지.`,
+			`목표: ${goal}\n읽기 전용으로 조사하고 ${stack ? "workflow_stack_propose로 선형 PR 분할·rootBase·각 branch·checks·requiredReviews·ciChecks·integrationChecks·integrationReviews" : "workflow_propose로 계획·검사 명령·종료 지점"}을 제안하세요. ${auto ? "사용자가 --auto로 시작해 계획은 안전 조건을 통과하면 자동 승인됩니다. 승인되면 사용자에게 묻지 말고 이어서 진행하세요." : "사용자 승인 전에는 구현하지 마세요."} 승인 후에는 workflow_dispatch로 작업·독립 검수를 분담하고 workflow_check로 검증하세요. commit·push·PR은 직접 실행하지 말고 검수 통과 뒤 workflow_dispatch role deliver로 전달 worker에게 맡기세요. merge·배포 금지.`,
 		);
 	}
 	status(): Workflow | { error: string } {
@@ -271,10 +302,18 @@ export class WorkflowController {
 	}
 	async propose(input: unknown): Promise<void> {
 		const state = this.running();
+		if (state.mode === "stack") throw new Error("stack 모드에서는 workflow_stack_propose를 사용하세요.");
 		if (!Value.Check(specSchema, input)) throw new Error("유효한 계획·검사 명령·종료 지점이 필요합니다.");
 		if (activeAttempts(state).length || this.checking || this.delivering)
 			throw new Error("실행 중 작업이 있어 계획을 바꿀 수 없습니다.");
 		const spec = normalizeSpec(input);
+		if (input.prBase !== undefined) {
+			if (spec.endpoint !== "pr") throw new Error("prBase는 pr 종료 지점에서만 지정합니다.");
+			if (input.prBase !== "stage" && protectedBranch(input.prBase))
+				throw new Error("보호 브랜치는 stacked PR base로 지정할 수 없습니다.");
+			if ((await run(state.repoRoot, "git", ["check-ref-format", "--branch", input.prBase])).code !== 0)
+				throw new Error("prBase가 올바른 브랜치 이름이 아닙니다.");
+		}
 		if (spec.checks.some((command) => guard("bash", { command })))
 			throw new Error("검사 명령에서 전달·merge·workflow 실행은 금지입니다.");
 		if (!Value.Check(specSchema, spec)) throw new Error("빈 계획·검사 명령은 허용하지 않습니다.");
@@ -286,17 +325,105 @@ export class WorkflowController {
 		state.approval = undefined;
 		state.verification = undefined;
 		state.review = undefined;
+		state.reviewResults = undefined;
 		await this.persist("propose");
+		if (state.autoApprove) {
+			await this.approve("auto").catch((error) => {
+				throw new Error(
+					`자동 승인 실패: ${error instanceof Error ? error.message : error} 해결 뒤 /workflow approve로 승인하세요.`,
+				);
+			});
+			return;
+		}
 		if (this.context?.hasUI) {
 			const choice = await this.context.ui.select(
-				`${spec.title}\n${spec.objective}\n검사: ${spec.checks.join("; ")}\n종료: ${spec.endpoint === "pr" ? "Draft PR" : spec.endpoint}`,
+				`${spec.title}\n${spec.objective}\n검사: ${spec.checks.join("; ")}\n종료: ${spec.endpoint === "pr" ? `Draft PR (base ${spec.prBase})` : spec.endpoint}`,
 				["승인", "보류"],
 				{ timeout: 60_000 },
 			);
 			if (choice === "승인") await this.approve("ui");
 		}
 	}
-	private async approve(via: "ui" | "command"): Promise<void> {
+	async proposeStack(input: unknown): Promise<void> {
+		const { state, plan } = await this.serial(async () => {
+			const state = this.running();
+			if (
+				state.mode !== "stack" ||
+				!["drafting", "awaiting-approval"].includes(state.phase) ||
+				state.stack?.approval ||
+				this.delivering
+			)
+				throw new Error("명시적으로 시작한 stack의 승인 대기 단계에서만 계획할 수 있습니다.");
+			if (!Value.Check(stackPlanSchema, input)) throw new Error("스택 계획 형식 오류");
+			const plan = normalizeStackPlan(input);
+			if (!Value.Check(stackPlanSchema, plan)) throw new Error("스택 계획에 빈 항목이나 중복이 있습니다.");
+			return { state, plan };
+		});
+		await validateStackPlan(state.repoRoot, plan);
+		await this.serial(async () => {
+			if (this.running() !== state || state.stack?.approval) throw new Error("계획 도중 상태가 변경되었습니다.");
+			state.stack = { plan, planVersion: stackVersion(plan), index: 0, stage: "planned", results: [] };
+			state.phase = "awaiting-approval";
+			await this.persist("stack proposed");
+		});
+		if (state.autoApprove) {
+			await this.approveStack("auto", stackVersion(plan));
+			return;
+		}
+		if (this.context?.hasUI) {
+			const choice = await this.context.ui.select(
+				`스택 계획 승인\n${JSON.stringify(plan, null, 2)}\n전달: commit·push·Draft PR. merge·배포·restack 금지.`,
+				["승인", "보류"],
+			);
+			if (choice === "승인") await this.approveStack("ui", stackVersion(plan));
+		}
+	}
+	private async approveStack(via: "ui" | "command" | "auto", expectedVersion?: string): Promise<void> {
+		const { state, observed } = await this.serial(async () => {
+			const state = this.running();
+			if (state.phase !== "awaiting-approval" || !state.stack || state.stack.approval || this.delivering)
+				throw new Error("승인할 스택 계획이 없습니다.");
+			if (expectedVersion && state.stack.planVersion !== expectedVersion)
+				throw new Error("승인 화면 이후 계획이 변경됐습니다. 새 계획을 확인하세요.");
+			const current = await snapshot(state.repoRoot);
+			if (current.statusShort) throw new Error("스택 승인에는 clean 작업 트리가 필요합니다.");
+			this.delivering = true;
+			return { state, observed: structuredClone(state) };
+		});
+		try {
+			const plan = observed.stack?.plan;
+			if (!plan) throw new Error("스택 계획이 없습니다.");
+			await validateStackPlan(state.repoRoot, plan);
+			const rootHead = await readStackBase(state.repoRoot, plan);
+			const rootFingerprint = await mustRun(state.repoRoot, "git", ["rev-parse", `${rootHead}^{tree}`]);
+			await this.serial(async () => {
+				if (!this.ownsInspection({ state, observed }) || state.control !== "running")
+					throw new Error("승인 중 워크플로가 중단됐습니다.");
+				const current = await snapshot(state.repoRoot);
+				if (current.statusShort) throw new Error("승인 도중 작업 트리가 변경됐습니다.");
+				if (!state.stack) throw new Error("스택 계획이 없습니다.");
+				state.stack.approval = {
+					at: this.at(),
+					via,
+					rootHead,
+					rootFingerprint,
+					sourceBranch: current.branch,
+					sourceHead: current.head,
+				};
+				activateStackUnit(state, this.at());
+				await this.persist("stack approved");
+			});
+		} finally {
+			await this.serial(async () => {
+				this.delivering = false;
+				if (this.state === state && state.control === "stopping" && !this.fatal) {
+					await this.settleStop();
+					await this.persist("stack approval stopped");
+				}
+			});
+		}
+	}
+	private async approve(via: "ui" | "command" | "auto"): Promise<void> {
 		const state = this.running();
 		if (state.phase !== "awaiting-approval" || !state.spec || !state.planVersion)
 			throw new Error("승인 대기 중인 계획이 없습니다.");
@@ -354,21 +481,25 @@ export class WorkflowController {
 			throw error;
 		}
 	}
-	private async prepareDispatch(input: DispatchInput): Promise<Attempt> {
-		const state = this.running();
-		const current = await this.approved(state);
-		if (this.checking || this.delivering) throw new Error("검사·전달 중에는 새 작업을 실행하지 않습니다.");
-		if (!["implement", "review", "research"].includes(input.role) || !input.task?.trim())
-			throw new Error("역할·작업이 필요합니다.");
-		if (!["executing", "reviewing", "ready-to-deliver"].includes(state.phase)) throw new Error("실행 단계가 아닙니다.");
-		const { agent, mode, thinking } = dispatchOptions(input);
-		/* 재개한 워크플로도 실행 시점의 subagent가 effort를 실제로 적용하는지 확인한다. */
-		if (thinking) {
-			const capabilities = this.request("capabilities") as { version?: number; features?: string[] } | undefined;
-			if (capabilities?.version !== 1 || !capabilities.features?.includes("thinking"))
-				throw new Error("현재 subagent 관리 API가 effort 지정을 지원하지 않습니다.");
+	private async assertDeliverable(state: Workflow, current: { head: string; fingerprint: string }): Promise<void> {
+		if (state.phase === "ready-to-deliver" && state.review && state.review.fingerprint !== current.fingerprint) {
+			await this.invalidateEvidence(state);
+			throw new Error("검수 이후 파일 변경: workflow_check로 재검사하세요.");
 		}
-		if (input.role === "implement") {
+		if (state.phase !== "ready-to-deliver" || activeAttempts(state).length || !evidenceValid(state))
+			throw new Error("검수된 내용과 같고 실행 중 작업이 없는 전달 단계에서만 허용합니다.");
+		if (current.head !== (deliveredHead(state) ?? state.approval?.head))
+			throw new Error("승인·전달 기록 뒤 다른 커밋이 있습니다.");
+	}
+	private async assertRoleReady(
+		role: Role,
+		agent: string,
+		state: Workflow,
+		current: { head: string; fingerprint: string },
+		reviewKey?: string,
+	): Promise<void> {
+		if (role === "prepare") return;
+		if (role === "implement") {
 			if (state.phase !== "executing" || activeAttempts(state).some((a) => a.role === "implement"))
 				throw new Error("구현은 executing에서 한 번에 하나만 실행합니다.");
 			if (
@@ -378,7 +509,7 @@ export class WorkflowController {
 			)
 				throw new Error("중단·실패한 구현은 workflow_recover로 실제 작업 공간을 기록하세요.");
 		}
-		if (input.role === "review") {
+		if (role === "review") {
 			if (state.phase === "reviewing" && state.verification && state.verification.fingerprint !== current.fingerprint) {
 				await this.invalidateEvidence(state);
 				throw new Error("검사 이후 파일 변경: workflow_check로 재검사하세요.");
@@ -387,19 +518,94 @@ export class WorkflowController {
 				state.phase !== "reviewing" ||
 				!state.verification?.id ||
 				state.verification.fingerprint !== current.fingerprint ||
-				activeAttempts(state).some((a) => a.role === "review")
+				activeAttempts(state).some((a) => a.role === "review" && (a.reviewKey ?? "code") === reviewKey)
 			)
 				throw new Error("현재 검사 증거가 없거나 검수 중입니다.");
-			if (state.attempts.some((a) => a.role === "implement" && a.agent === agent))
+			const implementations =
+				state.stack?.stage === "integration"
+					? [...state.attempts, ...state.stack.results.flatMap((result) => result.execution.attempts)]
+					: state.attempts;
+			if (implementations.some((attempt) => attempt.role === "implement" && attempt.agent === agent))
 				throw new Error("검수 agent는 구현 agent와 달라야 합니다.");
 		}
+		if (role === "deliver") await this.assertDeliverable(state, current);
+	}
+	private hasManagedPreparation(state: Workflow): boolean {
+		/* attempts는 PR 전환 때 비워진다. 재시작은 같은 PR의 시작 기록을 남기고 소유 세대만 올린다. */
+		return (
+			state.stack?.stage === "preparing" &&
+			state.attempts.some(
+				(attempt) =>
+					attempt.role === "prepare" &&
+					attempt.claimed === true &&
+					Number.isInteger(attempt.runId) &&
+					attempt.generation <= state.owner.generation &&
+					!["dispatching", "rejected"].includes(attempt.status),
+			)
+		);
+	}
+	private assertStackRole(
+		state: Workflow,
+		role: Role,
+		current: { branch: string; head: string; statusShort: string },
+	): void {
+		const stack = state.stack;
+		if (role === "prepare" && (!stack?.approval || stack.stage !== "preparing"))
+			throw new Error("prepare는 스택 브랜치 준비 단계 전용입니다.");
+		if (!stack) return;
+		if (stack.invalidatedFrom !== undefined) throw new Error("부모 변경으로 무효화된 스택입니다. 자동 restack 금지.");
+		if (stack.stage === "preparing") {
+			if (role !== "prepare" || activeAttempts(state).length || current.statusShort)
+				throw new Error("clean 상태에서 prepare worker 하나만 실행하세요.");
+			const previous = stack.results.at(-1);
+			const branch = previous?.branch ?? stack.approval?.sourceBranch;
+			const head = previous?.head ?? stack.approval?.sourceHead;
+			const prepared = current.branch === state.approval?.branch && current.head === state.approval.head;
+			if (prepared && !this.hasManagedPreparation(state))
+				throw new Error("관리 prepare 실행 기록 없는 동명 브랜치는 재사용하지 않습니다.");
+			if (!prepared && (current.branch !== branch || current.head !== head))
+				throw new Error("준비 시작 브랜치·HEAD가 승인과 다릅니다.");
+		}
+		if (stack.stage === "integration" && !["review", "research"].includes(role))
+			throw new Error("통합 단계에서는 검사와 검수만 허용합니다.");
+	}
+	private async prepareDispatch(input: DispatchInput): Promise<Attempt> {
+		const state = this.running();
+		const current = state.stack?.stage === "preparing" ? await snapshot(state.repoRoot) : await this.approved(state);
+		if (this.checking || this.delivering) throw new Error("검사·전달 중에는 새 작업을 실행하지 않습니다.");
+		if (!["implement", "review", "research", "deliver", "prepare"].includes(input.role) || !input.task?.trim())
+			throw new Error("역할·작업이 필요합니다.");
+		if (!["executing", "reviewing", "ready-to-deliver"].includes(state.phase)) throw new Error("실행 단계가 아닙니다.");
+		const { agent, mode, thinking } = dispatchOptions(input);
+		/* 재개한 워크플로도 실행 시점의 subagent가 effort를 실제로 적용하는지 확인한다. */
+		if (thinking) {
+			const capabilities = this.request("capabilities") as { version?: number; features?: string[] } | undefined;
+			if (capabilities?.version !== 1 || !capabilities.features?.includes("thinking"))
+				throw new Error("현재 subagent 관리 API가 effort 지정을 지원하지 않습니다.");
+		}
+		this.assertStackRole(state, input.role, current);
+		const keys = state.spec?.requiredReviews ?? ["code"];
+		const reviewKey =
+			input.role === "review" ? (input.reviewKey ?? (keys.length === 1 ? keys[0] : undefined)) : undefined;
+		if (input.role === "review" && (!reviewKey || !keys.includes(reviewKey)))
+			throw new Error("계획의 필수 검수 이름을 reviewKey로 지정하세요.");
+		await this.assertRoleReady(input.role, agent, state, current, reviewKey);
 		const attempt: Attempt = {
 			id: randomUUID(),
 			role: input.role,
+			...(reviewKey ? { reviewKey } : {}),
 			agent,
 			contextMode: mode,
 			...(thinking ? { thinking } : {}),
-			task: roleTask(input.role, input.task),
+			task: roleTask(
+				input.role,
+				input.role === "prepare"
+					? `${input.task}\n${prepareTask(state)}`
+					: `${input.task}${reviewKey ? `\n검수 관점: ${reviewKey}` : ""}`,
+				input.role === "deliver" && state.spec?.endpoint !== "verify" && state.spec
+					? { endpoint: state.spec.endpoint, base: prBase(state), branch: current.branch, head: current.head }
+					: undefined,
+			),
 			generation: state.owner.generation,
 			status: "dispatching",
 			fingerprintAtDispatch: current.fingerprint,
@@ -417,7 +623,9 @@ export class WorkflowController {
 			return;
 		}
 		if (event.type === "started" || event.type === "finished")
-			void this.serial(() => this.lifecycle(event)).catch((error) => this.notify(String(error)));
+			void this.serial(() => this.lifecycle(event))
+				.then((inspection) => inspection && this.deliveryFinished(inspection))
+				.catch((error) => this.notify(String(error)));
 	}
 	private claim(event: Extract<ManagedEvent, { type: "claim" }>): void {
 		if (typeof event.respond !== "function") return;
@@ -447,7 +655,7 @@ export class WorkflowController {
 			...(attempt.thinking ? { thinking: attempt.thinking } : {}),
 		});
 	}
-	private async lifecycle(event: Exclude<ManagedEvent, { type: "claim" }>): Promise<void> {
+	private async lifecycle(event: Exclude<ManagedEvent, { type: "claim" }>): Promise<DeliveryInspection | undefined> {
 		const state = this.state;
 		if (!state || !this.owned() || this.fatal || !event.owner || !sameOwner(event.owner, ownerOf(state))) return;
 		const attempt = state.attempts.find((a) => a.id === event.attemptId);
@@ -487,6 +695,108 @@ export class WorkflowController {
 		}
 		await this.settleStop();
 		await this.persist("finished");
+		const kind =
+			attempt.role === "prepare"
+				? "prepare"
+				: attempt.role === "deliver"
+					? "deliver"
+					: state.stack?.stage === "integration" && state.phase === "ready-to-deliver" && !activeAttempts(state).length
+						? "stack"
+						: undefined;
+		if (kind && state.control === "running") {
+			this.delivering = true;
+			return { state, observed: structuredClone(state), kind };
+		}
+	}
+	private ownsInspection({ state, observed }: DeliveryInspection): boolean {
+		return (
+			this.state === state &&
+			this.owned() &&
+			!this.fatal &&
+			sameOwner(ownerOf(state), ownerOf(observed)) &&
+			state.stack?.planVersion === observed.stack?.planVersion &&
+			state.stack?.index === observed.stack?.index &&
+			state.phase === observed.phase &&
+			state.verification?.id === observed.verification?.id &&
+			state.review?.fingerprint === observed.review?.fingerprint
+		);
+	}
+	private async deliveryFinished(inspection: DeliveryInspection): Promise<void> {
+		const { state, observed } = inspection;
+		let result: DeliveryResult | undefined;
+		let reason: string | undefined;
+		try {
+			/* 네트워크 조회는 직렬 큐 밖에서 복사본만 갱신한다. */
+			result = await this.inspectResult(observed, inspection.kind);
+			reason = result.complete
+				? "검수 증거가 유효하지 않습니다."
+				: `전달 미완료: ${result.reason} /workflow resume 뒤 다시 전달하세요.`;
+		} catch (error) {
+			reason = `전달 확인 실패: ${error instanceof Error ? error.message : String(error)}`;
+		}
+		await this.serial(async () => {
+			this.delivering = false;
+			if (this.ownsInspection(inspection) && state.control === "running") {
+				state.deliveries = observed.deliveries;
+				state.stack = observed.stack;
+				if (result?.complete && (inspection.kind === "prepare" || evidenceValid(state)))
+					this.applyInspection(state, inspection.kind);
+				else {
+					state.control = "blocked";
+					state.reason = reason;
+				}
+				if (state.stack?.invalidatedFrom !== undefined) {
+					state.verification = undefined;
+					state.review = undefined;
+					state.reviewResults = undefined;
+				}
+				await this.persist("delivery inspected");
+				this.wakeStack(state);
+			}
+			if (this.state === state && !this.fatal && state.control === "stopping") {
+				await this.settleStop();
+				await this.persist("delivery inspection stopped");
+			}
+		});
+	}
+	private async inspectResult(state: Workflow, kind: DeliveryInspection["kind"] = "deliver"): Promise<DeliveryResult> {
+		if (kind === "prepare") {
+			if (!this.hasManagedPreparation(state))
+				throw new Error("관리 prepare 실행 기록이 없어 브랜치 출처를 확인할 수 없습니다.");
+			await inspectPreparation(state);
+			return { complete: true };
+		}
+		if (kind === "stack") {
+			await inspectStackCompletion(state);
+			return { complete: true };
+		}
+		if (state.stack) await verifyStackDependencies(state);
+		const result = await inspectDelivery(state, this.at());
+		if (result.complete && state.stack) {
+			const head = deliveredHead(state);
+			if (!head) throw new Error("전달 커밋 기록이 없습니다.");
+			await verifyUnitCI(state.repoRoot, head, state.stack.plan.units[state.stack.index].ciChecks);
+			await verifyStackDependencies(state);
+			const current = await snapshot(state.repoRoot);
+			if (
+				current.head !== deliveredHead(state) ||
+				current.fingerprint !== state.review?.fingerprint ||
+				current.statusShort
+			)
+				throw new Error("전달 확인 도중 작업 트리·HEAD가 변경됐습니다.");
+		}
+		return result;
+	}
+	private applyInspection(state: Workflow, kind: DeliveryInspection["kind"] = "deliver"): void {
+		if (kind === "prepare" && state.stack) state.stack.stage = "unit";
+		else if (kind === "deliver" && state.stack) advanceStack(state, this.at());
+		else state.phase = "completed";
+	}
+	private wakeStack(state: Workflow): void {
+		if (state.mode === "stack" && state.control === "running" && !terminal(state) && this.context?.isIdle())
+			this.pi.sendUserMessage(stackInstruction(state) ?? "스택 다음 단계는 workflow_status로 확인하고 진행하세요.", {
+				deliverAs: "followUp",
+			});
 	}
 	private reviewFinished(state: Workflow, attempt: Attempt): void {
 		if (
@@ -499,8 +809,19 @@ export class WorkflowController {
 			return;
 		if (attempt.status !== "completed" || attempt.verdict === "missing") return;
 		if (attempt.verdict === "pass") {
+			const key = attempt.reviewKey ?? "code";
+			state.reviewResults = {
+				...state.reviewResults,
+				[key]: { attemptId: attempt.id, fingerprint: attempt.fingerprintAtFinish ?? "" },
+			};
+			if (
+				!(state.spec?.requiredReviews ?? ["code"]).every(
+					(name) => state.reviewResults?.[name]?.fingerprint === state.verification?.fingerprint,
+				)
+			)
+				return;
 			state.review = { attemptId: attempt.id, fingerprint: attempt.fingerprintAtFinish ?? "" };
-			state.phase = state.spec?.endpoint === "verify" ? "completed" : "ready-to-deliver";
+			state.phase = state.spec?.endpoint === "verify" && !state.stack ? "completed" : "ready-to-deliver";
 		}
 		if (attempt.verdict === "blocked") {
 			state.control = "blocked";
@@ -515,6 +836,7 @@ export class WorkflowController {
 				state.phase = "executing";
 				state.verification = undefined;
 				state.review = undefined;
+				state.reviewResults = undefined;
 			}
 		}
 	}
@@ -524,6 +846,7 @@ export class WorkflowController {
 		}
 		state.verification = undefined;
 		state.review = undefined;
+		state.reviewResults = undefined;
 		state.phase = "executing";
 		if (state.improvementCycles >= (state.spec?.maxImprovementCycles ?? 3)) {
 			state.control = "blocked";
@@ -559,10 +882,18 @@ export class WorkflowController {
 		const { state, before, commands, abort } = await this.serial(async () => {
 			const state = this.running();
 			await this.approved(state);
-			if (state.phase !== "executing" || this.checking || activeAttempts(state).some((a) => a.role === "implement"))
+			if (
+				state.phase !== "executing" ||
+				this.checking ||
+				this.delivering ||
+				state.stack?.stage === "preparing" ||
+				state.stack?.invalidatedFrom !== undefined ||
+				activeAttempts(state).some((a) => a.role === "implement")
+			)
 				throw new Error("구현 실행이 종료된 executing 단계에서만 검사합니다.");
 			state.verification = undefined;
 			state.review = undefined;
+			state.reviewResults = undefined;
 			state.checks = [];
 			/* 재검사는 실행 중인 이전 리뷰의 결과를 무효로 만들되 종료 기록은 받는다. */
 			for (const attempt of activeAttempts(state)) {
@@ -576,6 +907,20 @@ export class WorkflowController {
 			return { state, before, commands: [...(state.spec?.checks ?? [])], abort };
 		});
 		try {
+			if (state.stack) {
+				const observed = structuredClone(state);
+				try {
+					await verifyStackDependencies(observed);
+				} catch (error) {
+					await this.serial(async () => {
+						if (this.state === state && !this.fatal) {
+							state.stack = observed.stack;
+							await this.persist("stack dependency invalidated");
+						}
+					});
+					throw error;
+				}
+			}
 			for (const command of commands) {
 				if (abort.signal.aborted) throw new Error("검사가 중단되었습니다.");
 				const result = await runCheck(state.repoRoot, command, abort.signal, {
@@ -611,6 +956,15 @@ export class WorkflowController {
 				state.phase = "reviewing";
 				await this.persist("verified");
 			});
+		} catch (error) {
+			await this.serial(async () => {
+				if (this.state === state && state.stack && state.control === "running" && !this.fatal) {
+					state.control = "blocked";
+					state.reason = `스택 검사 실패: ${String(error)}`;
+					await this.persist("stack check blocked");
+				}
+			});
+			throw error;
 		} finally {
 			await this.serial(async () => {
 				this.checking = false;
@@ -658,59 +1012,6 @@ export class WorkflowController {
 		state.reason = reason;
 		await this.persist("blocked");
 	}
-	async deliver(input: DeliveryInput, signal?: AbortSignal): Promise<void> {
-		await this.withSignal(signal, () => this.performDelivery(input));
-	}
-	private async performDelivery(input: DeliveryInput): Promise<void> {
-		const state = await this.serial(async () => {
-			const state = this.running();
-			const current = await this.approved(state);
-			if (
-				state.phase === "ready-to-deliver" &&
-				((state.review && state.review.fingerprint !== current.fingerprint) ||
-					(state.verification && state.verification.fingerprint !== current.fingerprint))
-			) {
-				await this.invalidateEvidence(state);
-				throw new Error("검수 이후 파일 변경: workflow_check로 재검사하세요.");
-			}
-			if (
-				this.delivering ||
-				state.phase !== "ready-to-deliver" ||
-				activeAttempts(state).length ||
-				state.review?.fingerprint !== current.fingerprint
-			)
-				throw new Error("검수된 내용과 같고 실행 중 작업이 없는 전달 단계에서만 허용합니다.");
-			this.delivering = true;
-			return state;
-		});
-		try {
-			if (input.action === "commit") {
-				if (!input.message?.trim()) throw new Error("커밋 메시지가 필요합니다.");
-				await this.delivery.commit(state, input.message);
-			} else if (input.action === "pr") {
-				if (!input.title?.trim() || typeof input.body !== "string") throw new Error("PR 제목·본문이 필요합니다.");
-				await this.delivery.pr(state, input.title, input.body);
-			} else throw new Error("commit/pr만 허용합니다.");
-		} catch (error) {
-			await this.serial(async () => {
-				if (this.state === state && !this.fatal && state.control === "running") {
-					state.control = "blocked";
-					state.reason = String(error);
-					await this.persist("delivery blocked");
-				}
-			});
-			throw error;
-		} finally {
-			await this.serial(async () => {
-				this.delivering = false;
-				if (this.state === state && !this.fatal && state.control === "stopping") {
-					await this.settleStop();
-					await this.persist("delivery stopped");
-				}
-			});
-		}
-	}
-
 	private async stop(target: "paused" | "cancelled"): Promise<void> {
 		const state = this.state;
 		if (!state || !this.owned() || terminal(state)) throw new Error("중단할 소유 워크플로가 없습니다.");
@@ -761,25 +1062,47 @@ export class WorkflowController {
 		}
 	}
 	private async resume(): Promise<void> {
-		const state = await this.serial(async () => {
+		const inspection = await this.serial(async () => {
 			const state = this.requireState();
 			if (!["paused", "blocked"].includes(state.control) || /(?:개선|복구) 한도 초과/.test(state.reason ?? ""))
 				throw new Error("재개할 수 없는 상태입니다.");
 			if (activeAttempts(state).length || this.delivering || this.checking)
 				throw new Error("아직 종료하지 않은 작업이 있습니다.");
-			state.resumeSnapshot = state.approval ? await this.approved(state) : await snapshot(state.repoRoot);
+			state.resumeSnapshot =
+				state.approval && state.stack?.stage !== "preparing"
+					? await this.approved(state)
+					: await snapshot(state.repoRoot);
 			await this.persist("resume inspected");
 			this.delivering = true;
-			return state;
+			return { state, observed: structuredClone(state) };
 		});
+		const { state, observed } = inspection;
 		try {
-			await this.delivery.reconcile(state);
+			if (observed.stack?.approval) await verifyStackDependencies(observed);
+			await reconcileCommitIntents(observed);
+			const preparing =
+				observed.stack?.stage === "preparing" &&
+				(await snapshot(observed.repoRoot)).branch === observed.approval?.branch;
+			const kind: DeliveryInspection["kind"] = preparing
+				? "prepare"
+				: observed.stack?.stage === "integration"
+					? "stack"
+					: "deliver";
+			const result =
+				preparing || (observed.phase === "ready-to-deliver" && evidenceValid(observed))
+					? await this.inspectResult(observed, kind)
+					: undefined;
 			await this.serial(async () => {
-				if (this.state !== state || this.fatal || !["paused", "blocked"].includes(state.control))
+				if (!this.ownsInspection(inspection) || !["paused", "blocked"].includes(state.control))
 					throw new Error("재개 도중 상태가 변경되었습니다.");
-				if (terminal(state)) {
-					await this.persist("resume reconciled completed");
-					return;
+				state.deliveries = observed.deliveries;
+				state.stack = observed.stack;
+				if (result?.complete) {
+					this.applyInspection(state, kind);
+					if (terminal(state)) {
+						await this.persist("resume reconciled completed");
+						return;
+					}
 				}
 				state.control = "running";
 				state.reason = undefined;
@@ -790,7 +1113,14 @@ export class WorkflowController {
 			});
 		} catch (error) {
 			await this.serial(async () => {
-				if (this.state === state && !this.fatal && ["paused", "blocked"].includes(state.control)) {
+				if (this.ownsInspection(inspection) && ["paused", "blocked"].includes(state.control)) {
+					state.deliveries = observed.deliveries;
+					state.stack = observed.stack;
+					if (state.stack?.invalidatedFrom !== undefined) {
+						state.verification = undefined;
+						state.review = undefined;
+						state.reviewResults = undefined;
+					}
 					state.control = "blocked";
 					state.reason = String(error);
 					await this.persist("resume reconciliation blocked");
@@ -913,7 +1243,9 @@ export class WorkflowController {
 			if (
 				event.outcome !== "completed" ||
 				event.continue ||
-				!["executing", "reviewing", "ready-to-deliver"].includes(state.phase) ||
+				!["executing", "reviewing", "ready-to-deliver", ...(state.mode === "stack" ? ["drafting"] : [])].includes(
+					state.phase,
+				) ||
 				activeAttempts(state).length ||
 				this.checking ||
 				this.delivering ||
@@ -925,7 +1257,8 @@ export class WorkflowController {
 			const next = {
 				executing: "workflow_recover 필요 여부를 확인하고 workflow_dispatch로 구현하거나 workflow_check로 검사하세요.",
 				reviewing: "workflow_dispatch로 독립 검수하세요. 판정이 없거나 실패했다면 재검수하세요.",
-				"ready-to-deliver": "workflow_deliver로 승인된 종료 지점까지만 전달하세요.",
+				"ready-to-deliver":
+					"workflow_dispatch role deliver로 전달 worker를 실행해 승인된 종료 지점까지만 전달하세요. 직접 commit·push·PR 금지.",
 			};
 			return {
 				continue: true,
@@ -934,7 +1267,7 @@ export class WorkflowController {
 						type: "custom_message",
 						customType: "workflow-continue",
 						display: true,
-						content: next[state.phase as keyof typeof next],
+						content: stackInstruction(state) ?? next[state.phase as keyof typeof next],
 					},
 				],
 			};
