@@ -1,4 +1,4 @@
-import { stackPlanSchema } from "./stack-model.ts";
+import { stackPlanSchema, stackReplanSchema } from "./stack-model.ts";
 import {
 	getAgentDir,
 	type ExtensionAPI,
@@ -31,7 +31,7 @@ export function createWorkflowController(options: Options) {
 				label: `Workflow ${name}`,
 				description,
 				parameters,
-				defaultActive: ["status", "start"].includes(name),
+				defaultActive: ["status", "start", "preflight"].includes(name),
 				executionMode: "sequential",
 				execute: async (_toolCallId, params, signal, _onUpdate, ctx) => {
 					try {
@@ -83,6 +83,12 @@ export function createWorkflowController(options: Options) {
 		);
 		tool("status", "워크플로 정본 상태·증거를 조회한다.", Type.Object({}), async () => controller.status());
 		tool(
+			"preflight",
+			"상태를 바꾸지 않고 후보 계획의 승인 가능성·변경 인수 대상을 조회한다.",
+			Type.Object({ spec: Type.Optional(specSchema) }, { additionalProperties: false }),
+			async (params, ctx) => controller.preflight(params.spec, ctx.cwd),
+		);
+		tool(
 			"propose",
 			"계획과 검사·종료 지점을 제안한다. 승인은 사용자 명령·실제 UI 선택, 또는 사용자가 /workflow start --auto로 시작한 경우의 자동 승인만 허용한다.",
 			specSchema,
@@ -93,6 +99,13 @@ export function createWorkflowController(options: Options) {
 			"명시적 --stack 모드의 전체 PR 계획·검수·CI를 제안한다. 승인 전 쓰기 금지.",
 			stackPlanSchema,
 			async (params) => controller.proposeStack(params),
+			false,
+		);
+		tool(
+			"stack_replan",
+			"전달된 PR과 고정 부모는 보존하고 미전달 suffix를 재계획한다. 최초 위임 범위만 자동 적용하고 그 밖은 실제 UI 승인이 필요하다.",
+			stackReplanSchema,
+			async (params, ctx, signal) => controller.replan(params, ctx, signal),
 			false,
 		);
 		tool(

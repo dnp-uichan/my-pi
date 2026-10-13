@@ -1,4 +1,21 @@
-import { stackPlanSchema } from "./stack-model.ts";
+import {
+	preflight,
+	adoptionEvidence,
+	assertAdoptionScope,
+	assertRemoteTarget,
+	readRemoteTarget,
+	type WorkspaceEvidence,
+	type PreflightResult,
+} from "./preflight.ts";
+import {
+	applyReplan,
+	assertReplanReady,
+	delegatedReplan,
+	inspectReplan,
+	managedPreparation,
+	revisionAttempts,
+} from "./replan.ts";
+import { stackPlanSchema, type StackReplanInput } from "./stack-model.ts";
 import { activateStackUnit, advanceStack, normalizeStackPlan, stackInstruction, stackVersion } from "./stack-state.ts";
 import {
 	validateStackPlan,
@@ -18,7 +35,7 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import { Value } from "typebox/value";
 import { deliveredHead, inspectDelivery, prBase, reconcileCommitIntents, type DeliveryResult } from "./delivery.ts";
-import { alive, fingerprint, load, mustRun, run, runCheck, save, snapshot } from "./io.ts";
+import { alive, fingerprint, load, mustRun, runCheck, save, snapshot } from "./io.ts";
 import {
 	activeAttempts,
 	boundOutput,
@@ -31,7 +48,6 @@ import {
 	normalizeSpec,
 	ownerOf,
 	planVersion,
-	protectedBranch,
 	roleTask,
 	sameOwner,
 	specSchema,
@@ -48,12 +64,14 @@ import {
 
 export const toolNames = [
 	"status",
+	"preflight",
 	"start",
 	"pause",
 	"resume",
 	"cancel",
 	"propose",
 	"stack_propose",
+	"stack_replan",
 	"dispatch",
 	"check",
 	"recover",
@@ -105,6 +123,12 @@ function dispatchOptions(input: DispatchInput): {
 	if (input.thinking !== undefined && !(DISPATCH_THINKING_LEVELS as readonly string[]).includes(input.thinking))
 		throw new Error(`effort는 ${DISPATCH_THINKING_LEVELS.join("·")} 중 하나여야 합니다.`);
 	return { agent, mode, thinking: input.thinking as DispatchThinking | undefined };
+}
+
+function adoptionInstruction(state: Workflow, fingerprint: string): string {
+	const adoption = state.approval?.adoption;
+	if (!adoption) return "";
+	return `\n인수 보완 허용 경로: ${adoption.allowedPaths.join(", ")}\n인수 기준 HEAD: ${state.approval?.head}\n현재 tree: ${fingerprint}`;
 }
 
 export class WorkflowController {
@@ -177,19 +201,30 @@ export class WorkflowController {
 		}
 		if (current.repoRoot !== state.approval.repoRoot || current.branch !== state.approval.branch)
 			throw new Error("승인된 저장소·브랜치와 다릅니다.");
+		try {
+			await assertRemoteTarget(state.repoRoot, state.approval.target);
+			await assertAdoptionScope(state, current);
+		} catch (error) {
+			if (state.verification || state.review) await this.invalidateEvidence(state);
+			throw error;
+		}
+		if (state.approval.adoption && state.verification && state.verification.fingerprint !== current.fingerprint)
+			await this.invalidateEvidence(state);
 		return current;
 	}
 	private display(): void {
 		const state = this.state;
 		const enabled = state && this.owned() && !this.fatal && !terminal(state);
 		const active = this.pi.getActiveTools().filter((name) => !toolNames.includes(name));
-		const lifecycle = ["workflow_status", "workflow_start"];
+		const lifecycle = ["workflow_status", "workflow_start", "workflow_preflight"];
 		this.pi.setActiveTools(
 			enabled
 				? [
 						...active,
-						...toolNames.filter(
-							(name) => name !== (state.mode === "stack" ? "workflow_propose" : "workflow_stack_propose"),
+						...toolNames.filter((name) =>
+							state.mode === "stack"
+								? name !== "workflow_propose"
+								: !["workflow_stack_propose", "workflow_stack_replan"].includes(name),
 						),
 					]
 				: [...active, ...lifecycle],
@@ -229,7 +264,14 @@ export class WorkflowController {
 		return response;
 	}
 	private assertRunsStopped(state: Workflow): void {
-		const generations = new Set([state.owner.generation, ...state.attempts.map((attempt) => attempt.generation)]);
+		const generations = new Set([
+			state.owner.generation,
+			...[
+				...state.attempts,
+				...revisionAttempts(state, true),
+				...(state.stack?.results.flatMap((result) => result.execution.attempts) ?? []),
+			].map((attempt) => attempt.generation),
+		]);
 		for (const generation of generations) {
 			const response = this.request("inspect", { owner: { workflowId: state.workflowId, generation } }) as
 				| { ok?: boolean; runs?: { status: string; abortPending?: boolean }[] }
@@ -288,11 +330,12 @@ export class WorkflowController {
 			this.notify(String(error));
 		}
 	}
-	async startFromTool(input: { goal: string; mode?: "single" | "stack" }, ctx: ExtensionToolContext): Promise<void> {
-		await this.serial(async () => {
+	async startFromTool(input: { goal: string; mode?: "single" | "stack" }, ctx: ExtensionToolContext) {
+		return this.serial(async () => {
 			this.context = ctx;
 			if (this.state?.userHold) throw new Error("사용자 보류는 /workflow resume 또는 /workflow start로만 해제합니다.");
-			await this.start(input.goal.trim(), false, input.mode === "stack", "orchestrator");
+			const guidance = await this.start(input.goal.trim(), false, input.mode === "stack", "orchestrator");
+			return { ...this.status(), guidance };
 		});
 	}
 	async stopFromTool(target: "paused" | "cancelled", reason: string, ctx: ExtensionToolContext): Promise<void> {
@@ -321,7 +364,7 @@ export class WorkflowController {
 			await stopping;
 		}
 	}
-	private async start(goal: string, auto: boolean, stack = false, source: ControlSource = "user"): Promise<void> {
+	private async start(goal: string, auto: boolean, stack = false, source: ControlSource = "user"): Promise<string> {
 		if (this.fatal || this.readOnly) throw new Error(this.fatal ?? "다른 프로세스 소유 워크플로입니다.");
 		if (this.state && !this.owned()) throw new Error("다른 세션 소유 워크플로입니다.");
 		if (this.state && !terminal(this.state)) throw new Error("세션당 비종료 워크플로는 하나입니다.");
@@ -371,63 +414,89 @@ export class WorkflowController {
 			repoKey: this.state.repoKey,
 			repoRoot: this.state.repoRoot,
 		});
-		if (source === "user")
-			this.pi.sendUserMessage(
-				`목표: ${goal}\n읽기 전용으로 조사하고 ${stack ? "workflow_stack_propose로 선형 PR 분할·rootBase·각 branch·checks·requiredReviews·ciChecks·integrationChecks·integrationReviews" : "workflow_propose로 계획·검사 명령·종료 지점"}을 제안하세요. ${auto ? "사용자가 --auto로 시작해 계획은 안전 조건을 통과하면 자동 승인됩니다. 승인되면 사용자에게 묻지 말고 이어서 진행하세요." : "사용자 승인 전에는 구현하지 마세요."} 승인 후에는 workflow_dispatch로 작업·독립 검수를 분담하고 workflow_check로 검증하세요. commit·push·PR은 직접 실행하지 말고 검수 통과 뒤 workflow_dispatch role deliver로 전달 worker에게 맡기세요. merge·배포 금지.`,
-			);
+		const guidance = [
+			`목표: ${goal}`,
+			"먼저 읽기 전용으로 조사하세요. 코드·문서·조회 도구로 확인할 사실과 기존 패턴의 기술적 선택은 직접 해결하고, 결과를 바꾸는 정책·범위·우선순위만 사용자에게 물으세요.",
+			"인터뷰 깊이는 구현 난이도나 고정 질문 수가 아니라 남은 불확실성·실패 영향으로 정하세요. 명확하면 질문 없이, 일부만 불명확하면 관련 질문을 묶어서, 정책·의존관계가 얽히면 해당 부분만 깊게 확인하세요. 이미 합의한 답은 반복해서 묻지 마세요.",
+			"목표·제외 범위·성공 기준·수정 범위·허용 대안·실패 시 대응과 보완/복구 한도를 합의하세요. 합의는 기존 objective·nonGoals·successCriteria·checks·requiredReviews와 관련 계획 필드에 담고 별도 인터뷰 상태나 문서를 만들지 마세요.",
+			stack
+				? "각 PR의 결과·제외 범위·rootBase·각 branch·부모 관계·검토 순서·checks·requiredReviews·ciChecks와 전체 integrationChecks·integrationReviews를 정하세요. 자동 조정 범위는 기존 replanPolicy·allowedPaths의 제한 안에서 합의하고 workflow_stack_propose로 전체 계획을 제안하세요."
+				: '사용자가 더 이른 종료 지점을 명시하지 않았다면 endpoint: "pr"로 제안하세요. 저장소·head·prBase와 commit·push·Draft PR 권한을 최종 합의에 포함하고 workflow_propose로 계획을 제안하세요.',
+			"질문 개수가 아니라 실행을 막는 결정이 모두 해소됐는지로 인터뷰를 끝내고 최종 요약을 먼저 설명하세요. 같은 합의를 별도 승인 폼으로 반복하지 마세요.",
+			auto
+				? "사용자가 --auto로 시작해 안전 조건을 통과한 계획은 자동 승인됩니다. 미결정 정책을 임의로 정하는 권한은 아닙니다."
+				: "기존 계획 승인 UI를 한 번의 실행 승인으로 사용하세요. 사용자 승인 전에는 구현·commit·push·PR을 실행하지 마세요.",
+			"승인 뒤에는 workflow_dispatch로 구현·독립 검수를 분담하고 workflow_check로 검증하세요. 합의 범위와 한도 안의 실패·보완·재검증은 재승인 없이 처리하세요. 검수 통과 뒤 verify는 종료하고, commit·pr은 승인된 종료 지점까지만 workflow_dispatch role deliver로 전달 worker에게 맡기세요. 직접 Git 전달·merge·배포 금지.",
+			"스택은 각 PR의 사용자 리뷰를 기다리지 말고 승인한 전체 스택과 통합 검증까지 이어가세요. 합의 밖 결정·권한, 해결할 수 없는 인증/환경 문제, 사용자 중단은 우회하지 마세요. 사용자 판단이 필요하면 workflow_block으로 이유를 남기세요.",
+			"PR 종료 계획은 실제 PR 전달 확인 후 PR 링크·검토 순서·주요 변경·검증 결과·제외/후속 범위를 인계하세요. 로컬 구현이나 테스트 통과만으로 완료하지 마세요.",
+		].join("\n");
+		if (source === "user") this.pi.sendUserMessage(guidance);
+		return guidance;
 	}
 	status(): Workflow | { error: string } {
 		if (this.fatal) return { error: this.fatal };
 		return this.state ? structuredClone(this.state) : { error: "워크플로가 없습니다." };
 	}
+	async preflight(input?: unknown, cwd = this.context?.cwd ?? this.state?.repoRoot ?? ""): Promise<PreflightResult> {
+		const blockers: string[] = [];
+		if (input !== undefined) {
+			if (this.checking || this.delivering || (this.state && activeAttempts(this.state).length))
+				blockers.push("실행 중 작업이 있어 계획을 바꿀 수 없습니다.");
+			if (this.state) {
+				try {
+					this.assertRunsStopped(this.state);
+				} catch (error) {
+					blockers.push(error instanceof Error ? error.message : "관리 실행 종료 확인 불가");
+				}
+			}
+		}
+		const result = await preflight(cwd, input);
+		if (input !== undefined) {
+			if (this.state && result.workspace && result.workspace.repoRoot !== this.state.repoRoot)
+				blockers.push("계획 저장소와 다릅니다.");
+			result.blockers.push(...blockers);
+			result.eligible = !!result.workspace && !result.blockers.length;
+		}
+		return result;
+	}
 	async propose(input: unknown): Promise<void> {
 		const state = this.running();
 		if (state.mode === "stack") throw new Error("stack 모드에서는 workflow_stack_propose를 사용하세요.");
-		if (!Value.Check(specSchema, input)) throw new Error("유효한 계획·검사 명령·종료 지점이 필요합니다.");
-		if (activeAttempts(state).length || this.checking || this.delivering)
-			throw new Error("실행 중 작업이 있어 계획을 바꿀 수 없습니다.");
+		const candidate = await this.preflight(input);
+		if (!candidate.eligible || !candidate.workspace) throw new Error(candidate.blockers.join("\n"));
+		if (!Value.Check(specSchema, input)) throw new Error("유효한 계획이 필요합니다.");
 		const spec = normalizeSpec(input);
-		if (spec.deliveryMode && spec.endpoint !== "pr") throw new Error("기존 커밋 전달은 pr 종료 지점에서만 지정합니다.");
-		if (input.prBase !== undefined) {
-			if (spec.endpoint !== "pr") throw new Error("prBase는 pr 종료 지점에서만 지정합니다.");
-			if (input.prBase !== "stage" && protectedBranch(input.prBase))
-				throw new Error("보호 브랜치는 stacked PR base로 지정할 수 없습니다.");
-			if ((await run(state.repoRoot, "git", ["check-ref-format", "--branch", input.prBase])).code !== 0)
-				throw new Error("prBase가 올바른 브랜치 이름이 아닙니다.");
-		}
-		if (spec.checks.some((command) => guard("bash", { command })))
-			throw new Error("검사 명령에서 전달·merge·workflow 실행은 금지입니다.");
-		if (!Value.Check(specSchema, spec)) throw new Error("빈 계획·검사 명령은 허용하지 않습니다.");
 		const version = planVersion(spec);
 		if (version === state.planVersion && state.approval) return;
+		let choice: string | undefined;
+		if (!state.autoApprove && this.context?.hasUI) {
+			choice = await this.requestApproval(spec, candidate.workspace);
+			if (choice !== "승인" && state.spec) return;
+		}
+		const via = state.autoApprove ? "auto" : choice === "승인" ? "ui" : undefined;
+		if (via) {
+			const latest = await this.preflight(input);
+			if (this.running() !== state || !latest.eligible || latest.workspace?.signature !== candidate.workspace.signature)
+				throw new Error("승인 화면 이후 계획·브랜치·HEAD·파일·index·원격이 변경되었습니다. 새 승인 화면을 확인하세요.");
+		}
+
 		state.spec = spec;
 		state.planVersion = version;
-		state.phase = "awaiting-approval";
-		state.approval = undefined;
+		state.proposalWorkspace = candidate.workspace;
+		state.phase = via ? "executing" : "awaiting-approval";
+		state.approval = via ? this.approvalRecord(spec, version, candidate.workspace, via) : undefined;
 		state.verification = undefined;
 		state.review = undefined;
 		state.reviewResults = undefined;
 		await this.persist("propose");
-		if (state.autoApprove) {
-			await this.approve("auto").catch((error) => {
-				throw new Error(
-					`자동 승인 실패: ${error instanceof Error ? error.message : error} 해결 뒤 /workflow approve로 승인하세요.`,
-				);
-			});
-			return;
-		}
-		await this.requestApproval(state, spec, version);
+		if (via) await this.persist("approve");
 	}
-	private async requestApproval(state: Workflow, spec: Spec, version: string): Promise<void> {
-		if (this.context?.hasUI) {
-			const displayed = spec.deliveryMode === "existing-commit" ? await snapshot(state.repoRoot) : undefined;
-			const choice = await this.context.ui.select(
-				`${spec.title}\n${spec.objective}\n검사: ${spec.checks.join("; ")}\n종료: ${spec.endpoint === "pr" ? `Draft PR (base ${spec.prBase})` : spec.endpoint}${displayed ? `\n기존 커밋 전달: ${displayed.head} (${displayed.branch}), 새 커밋 생성 금지` : ""}`,
-				["승인", "보류"],
-				{ timeout: 60_000 },
-			);
-			if (choice === "승인") await this.approve("ui", displayed ? { version, snapshot: displayed } : undefined);
-		}
+	private async requestApproval(spec: Spec, workspace: WorkspaceEvidence): Promise<string | undefined> {
+		return this.context?.ui.select(
+			`${spec.title}\n${spec.objective}\n제외 범위: ${spec.nonGoals.join("; ") || "없음"}\n성공 기준: ${spec.successCriteria.join("; ")}\n검사: ${spec.checks.join("; ")}\n필수 검수: ${(spec.requiredReviews ?? ["code"]).join("; ")}\n한도: 보완 ${spec.maxImprovementCycles}회, 복구 ${spec.maxRecoveries}회\n종료: ${spec.endpoint === "pr" ? `${spec.deliveryMode === "existing-commit" ? "기존 commit 유지·push" : "commit·push"}·Draft PR (base ${spec.prBase}, head ${workspace.branch})` : spec.endpoint}\nmerge·배포 금지.\n저장소: ${workspace.repoRoot}\n브랜치: ${workspace.branch}\n기준 HEAD: ${workspace.head}\n지문: ${workspace.fingerprint}\nindex: ${workspace.indexFingerprint}${workspace.remote ? `\norigin: ${workspace.remote.display}\npush: ${workspace.remote.pushDisplay}` : ""}${spec.deliveryMode === "existing-commit" ? `\n기존 커밋 전달: ${workspace.head}, 새 커밋 생성 금지` : ""}${spec.adoptChanges ? `\n기존 변경 인수:\n${workspace.changes.map((change) => `${change.status} ${change.originalPath ? `${change.originalPath} → ` : ""}${change.path}`).join("\n")}\n변경 요약:\n${workspace.summary}\n보완 허용 경로: ${(spec.adoptChanges.allowedPaths ?? spec.adoptChanges.paths).join(", ")}` : ""}`,
+			["승인", "보류"],
+			{ timeout: 60_000 },
+		);
 	}
 	async proposeStack(input: unknown): Promise<void> {
 		const { state, plan } = await this.serial(async () => {
@@ -463,6 +532,63 @@ export class WorkflowController {
 			if (choice === "승인") await this.approveStack("ui", stackVersion(plan));
 		}
 	}
+	async replan(input: StackReplanInput, ctx: ExtensionToolContext, signal?: AbortSignal): Promise<void> {
+		this.context = ctx;
+		await this.withSignal(signal, async () => {
+			const inspection = await this.serial(async () => {
+				const state = this.running();
+				assertReplanReady(state);
+				if (this.checking || this.delivering) throw new Error("검사·전달·재계획 중에는 새 재계획을 하지 않습니다.");
+				this.assertRunsStopped(state);
+				this.delivering = true;
+				return { state, observed: structuredClone(state) };
+			});
+			const { state, observed } = inspection;
+			try {
+				const plan = normalizeStackPlan(input.plan);
+				const candidate = await inspectReplan(observed, plan, input);
+				const automatic = delegatedReplan(observed, plan, input);
+				await this.serial(async () => {
+					if (!this.ownsInspection(inspection) || state.control !== "running" || signal?.aborted)
+						throw new Error("재계획 검사 도중 상태가 변경됐습니다.");
+				});
+				if (!automatic) {
+					if (!ctx.hasUI)
+						throw new Error("최초 위임 범위 밖 재계획은 실제 사용자 UI 승인이 필요합니다. --auto로 우회하지 않습니다.");
+					const choice = await ctx.ui.select(
+						`스택 재계획 승인\n이유: ${input.reason}\n변경 전:\n${JSON.stringify(observed.stack?.plan, null, 2)}\n변경 후:\n${JSON.stringify(plan, null, 2)}\n영향 범위: ${observed.stack?.index} 이후 미전달 단위\n제외 요구(완료 아님): ${(input.excludedRequirements ?? []).join(", ")}\n저장소: ${candidate.workspace.repoRoot}\n브랜치: ${candidate.workspace.branch}\n기준 HEAD: ${candidate.workspace.head}\n지문: ${candidate.workspace.fingerprint}\nindex: ${candidate.workspace.indexFingerprint}\norigin: ${candidate.workspace.remote?.display}\npush: ${candidate.workspace.remote?.pushDisplay}\n인수 파일: ${JSON.stringify(candidate.workspace.changes)}\n변경 요약: ${candidate.workspace.summary}\n보완 허용 경로: ${(input.adoptChanges?.allowedPaths ?? input.adoptChanges?.paths ?? []).join(", ")}`,
+						["승인", "보류"],
+						{ timeout: 60_000 },
+					);
+					if (choice !== "승인") return;
+				}
+				const latest = await inspectReplan(observed, plan, input);
+				await this.serial(async () => {
+					if (
+						!this.ownsInspection(inspection) ||
+						state.control !== "running" ||
+						state.userHold ||
+						signal?.aborted ||
+						latest.workspace.signature !== candidate.workspace.signature ||
+						latest.prepared !== candidate.prepared
+					)
+						throw new Error("재계획 승인 이후 상태·HEAD·파일·index·원격이 변경되었습니다.");
+					this.assertRunsStopped(state);
+					applyReplan(state, candidate.candidate, plan, input, automatic ? "scope" : "ui", this.at());
+					await this.persist("stack replanned");
+					this.wakeStack(state);
+				});
+			} finally {
+				await this.serial(async () => {
+					this.delivering = false;
+					if (this.state === state && state.control === "stopping" && !this.fatal) {
+						await this.settleStop();
+						await this.persist("stack replan stopped");
+					}
+				});
+			}
+		});
+	}
 	private async approveStack(via: "ui" | "command" | "auto", expectedVersion?: string): Promise<void> {
 		const { state, observed } = await this.serial(async () => {
 			const state = this.running();
@@ -480,6 +606,8 @@ export class WorkflowController {
 			if (!plan) throw new Error("스택 계획이 없습니다.");
 			await validateStackPlan(state.repoRoot, plan);
 			const rootHead = await readStackBase(state.repoRoot, plan);
+			const target = await readRemoteTarget(state.repoRoot);
+			if (!target) throw new Error("스택 승인에는 origin 전달 대상이 필요합니다.");
 			const rootFingerprint = await mustRun(state.repoRoot, "git", ["rev-parse", `${rootHead}^{tree}`]);
 			await this.serial(async () => {
 				if (!this.ownsInspection({ state, observed }) || state.control !== "running")
@@ -494,6 +622,8 @@ export class WorkflowController {
 					rootFingerprint,
 					sourceBranch: current.branch,
 					sourceHead: current.head,
+					initialPlan: structuredClone(plan),
+					target,
 				};
 				activateStackUnit(state, this.at());
 				await this.persist("stack approved");
@@ -510,38 +640,42 @@ export class WorkflowController {
 	}
 	private async approve(
 		via: "ui" | "command" | "auto",
-		displayed?: { version: string; snapshot: Awaited<ReturnType<typeof snapshot>> },
+		displayed?: { version: string; workspace: WorkspaceEvidence },
 	): Promise<void> {
 		const state = this.running();
 		if (state.phase !== "awaiting-approval" || !state.spec || !state.planVersion)
 			throw new Error("승인 대기 중인 계획이 없습니다.");
-		const current = await snapshot(this.context?.cwd ?? state.repoRoot);
-		if (current.repoRoot !== state.repoRoot) throw new Error("계획 저장소와 다릅니다.");
+		const result = await this.preflight(state.spec);
+		if (!result.eligible || !result.workspace) throw new Error(result.blockers.join("\n"));
+		const current = result.workspace;
 		if (
-			displayed &&
-			(displayed.version !== state.planVersion ||
-				current.head !== displayed.snapshot.head ||
-				current.branch !== displayed.snapshot.branch ||
-				current.fingerprint !== displayed.snapshot.fingerprint)
+			(displayed && (displayed.version !== state.planVersion || current.signature !== displayed.workspace.signature)) ||
+			(state.spec.endpoint !== "verify" &&
+				state.proposalWorkspace &&
+				current.signature !== state.proposalWorkspace.signature)
 		)
-			throw new Error(
-				"승인 화면 이후 계획·브랜치·HEAD가 변경되었습니다. 새 승인 화면 또는 /workflow approve로 다시 승인하세요.",
-			);
-		if (state.spec.endpoint !== "verify" && current.statusShort)
-			throw new Error("commit/pr 승인에는 clean 작업 트리가 필요합니다.");
-		if (state.spec.endpoint === "pr" && protectedBranch(current.branch))
-			throw new Error("보호 브랜치에서 PR 승인은 금지입니다.");
-		state.approval = {
-			planVersion: state.planVersion,
+			throw new Error("승인 화면 이후 계획·브랜치·HEAD·파일·index·원격이 변경되었습니다. 새 승인 화면을 확인하세요.");
+		state.approval = this.approvalRecord(state.spec, state.planVersion, current, via);
+		state.phase = "executing";
+		await this.persist("approve");
+	}
+	private approvalRecord(
+		spec: Spec,
+		version: string,
+		current: WorkspaceEvidence,
+		via: "ui" | "command" | "auto",
+	): NonNullable<Workflow["approval"]> {
+		return {
+			planVersion: version,
 			at: this.at(),
 			via,
 			repoRoot: current.repoRoot,
 			branch: current.branch,
 			head: current.head,
 			fingerprint: current.fingerprint,
+			...(spec.adoptChanges ? { adoption: adoptionEvidence(spec, current) } : {}),
+			...(spec.endpoint === "pr" ? { target: current.remote } : {}),
 		};
-		state.phase = "executing";
-		await this.persist("approve");
 	}
 	async dispatch(input: DispatchInput, ctx: ExtensionToolContext): Promise<void> {
 		this.context = ctx;
@@ -623,26 +757,19 @@ export class WorkflowController {
 				throw new Error("현재 검사 증거가 없거나 검수 중입니다.");
 			const implementations =
 				state.stack?.stage === "integration"
-					? [...state.attempts, ...state.stack.results.flatMap((result) => result.execution.attempts)]
-					: state.attempts;
+					? [
+							...state.attempts,
+							...revisionAttempts(state, true),
+							...state.stack.results.flatMap((result) => result.execution.attempts),
+						]
+					: [...state.attempts, ...revisionAttempts(state)];
 			if (implementations.some((attempt) => attempt.role === "implement" && attempt.agent === agent))
 				throw new Error("검수 agent는 구현 agent와 달라야 합니다.");
 		}
 		if (role === "deliver") await this.assertDeliverable(state, current);
 	}
 	private hasManagedPreparation(state: Workflow): boolean {
-		/* attempts는 PR 전환 때 비워진다. 재시작은 같은 PR의 시작 기록을 남기고 소유 세대만 올린다. */
-		return (
-			state.stack?.stage === "preparing" &&
-			state.attempts.some(
-				(attempt) =>
-					attempt.role === "prepare" &&
-					attempt.claimed === true &&
-					Number.isInteger(attempt.runId) &&
-					attempt.generation <= state.owner.generation &&
-					!["dispatching", "rejected"].includes(attempt.status),
-			)
-		);
+		return state.stack?.stage === "preparing" && managedPreparation(state);
 	}
 	private assertStackRole(
 		state: Workflow,
@@ -701,7 +828,7 @@ export class WorkflowController {
 				input.role,
 				input.role === "prepare"
 					? `${input.task}\n${prepareTask(state)}`
-					: `${input.task}${reviewKey ? `\n검수 관점: ${reviewKey}` : ""}`,
+					: `${input.task}${reviewKey ? `\n검수 관점: ${reviewKey}` : ""}${adoptionInstruction(state, current.fingerprint)}`,
 				input.role === "deliver" && state.spec?.endpoint !== "verify" && state.spec
 					? {
 							endpoint: state.spec.endpoint,
@@ -818,7 +945,8 @@ export class WorkflowController {
 		}
 	}
 	private async validateExistingAttempt(state: Workflow, attempt: Attempt): Promise<void> {
-		if (state.control !== "running" || state.spec?.deliveryMode !== "existing-commit") return;
+		if (state.control !== "running") return;
+		if (!state.spec?.deliveryMode && !state.approval?.adoption && !state.approval?.target) return;
 		if (attempt.role === "review") {
 			try {
 				await this.approved(state);
@@ -829,7 +957,11 @@ export class WorkflowController {
 				state.reason = String(error);
 			}
 		}
-		if (attempt.role === "deliver" && attempt.status !== "completed") {
+		if (
+			state.spec?.deliveryMode === "existing-commit" &&
+			attempt.role === "deliver" &&
+			attempt.status !== "completed"
+		) {
 			state.control = "blocked";
 			state.controlSource = "system";
 			state.reason = "기존 커밋 전달 worker 실패: 실제 원격·PR 결과를 재개로 확인하세요.";
@@ -865,7 +997,7 @@ export class WorkflowController {
 		await this.serial(async () => {
 			this.delivering = false;
 			if (this.ownsInspection(inspection) && state.control === "running") {
-				if (state.spec?.deliveryMode === "existing-commit") {
+				if (state.spec?.deliveryMode === "existing-commit" || state.approval?.adoption || state.approval?.target) {
 					try {
 						await this.approved(state);
 					} catch (error) {
@@ -1258,7 +1390,11 @@ export class WorkflowController {
 			await this.serial(async () => {
 				if (signal?.aborted || !this.ownsInspection(inspection) || !["paused", "blocked"].includes(state.control))
 					throw new Error("재개 도중 상태가 변경되었습니다.");
-				if (result?.complete && state.spec?.deliveryMode === "existing-commit") await this.approved(state);
+				if (
+					result?.complete &&
+					(state.spec?.deliveryMode === "existing-commit" || state.approval?.adoption || state.approval?.target)
+				)
+					await this.approved(state);
 				state.deliveries = observed.deliveries;
 				state.stack = observed.stack;
 				if (result?.complete) {

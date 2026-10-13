@@ -36,6 +36,9 @@ async function harness(managed = true, shared?: { root: string; refs: any[] }, o
 		await writeFile(join(repo, "file.txt"), "initial\n");
 		git(repo, "add", "-A");
 		git(repo, "commit", "-m", "initial");
+		const approvalRemote = join(root, "approval-origin.git");
+		git(root, "init", "--bare", approvalRemote);
+		git(repo, "remote", "add", "origin", approvalRemote);
 	}
 	const events = createEventBus();
 	const tools = new Map<string, ToolDefinition<any>>();
@@ -314,14 +317,15 @@ describe("관리형 워크플로", () => {
 		expect(state.approval.planVersion).toBe(state.planVersion);
 		expect(state.phase).toBe("executing");
 	});
-	it("--auto여도 승인 안전 조건을 통과하지 못하면 승인 대기로 남긴다", async () => {
+	it("--auto여도 불가능한 제안은 기존 초안을 보존한다", async () => {
 		/* [Given] */ const h = await harness();
 		await h.command("start --auto 파일 변경");
 		await writeFile(join(h.repo, "file.txt"), "dirty\n");
 		/* [When] */ const result = await h.call("propose", { ...spec, endpoint: "commit" });
 		/* [Then] */ expect(result.isError).toBe(true);
 		const state = await h.state();
-		expect(state.phase).toBe("awaiting-approval");
+		expect(state.phase).toBe("drafting");
+		expect(state.spec).toBeUndefined();
 		expect(state.approval).toBeUndefined();
 	});
 	it("--auto 없이 시작하면 자동 승인하지 않는다", async () => {
@@ -783,6 +787,46 @@ describe("fatal 이후 소유 실행 중단", () => {
 	);
 });
 
+describe("인터뷰 합의 전달", () => {
+	it.each(["single", "stack"])("%s 도구 시작도 명령 시작과 같은 안내를 일회성 응답으로 받는다", async (mode) => {
+		/* [Given] */ const command = await harness();
+		const tool = await harness();
+		await command.command(`start ${mode === "stack" ? "--stack " : ""}설정 개선`);
+		/* [When] */ const result = await tool.call("start", { goal: "설정 개선", mode });
+		/* [Then] */ expect(result.isError).not.toBe(true);
+		const details = result.details;
+		const content = result.content[0];
+		if (typeof details !== "object" || details === null || !("guidance" in details) || content?.type !== "text")
+			throw new Error("시작 응답에 안내와 텍스트 본문이 필요합니다.");
+		expect(details.guidance).toBe(command.messages[0]);
+		expect(details.guidance).toEqual(expect.any(String));
+		expect(JSON.parse(content.text).guidance).toBe(details.guidance);
+		expect((await tool.state()).guidance).toBeUndefined();
+		expect(tool.messages).toHaveLength(0);
+	});
+	it("PR 승인 전에 제외 범위·완료 기준·필수 검수와 실행 한도를 보여준다", async () => {
+		/* [Given] */ const h = await harness();
+		h.select("보류");
+		const proposal = {
+			...spec,
+			endpoint: "pr",
+			nonGoals: ["결제 정책 변경 제외"],
+			successCriteria: ["설정 저장 후 재접속해도 선택 유지"],
+			requiredReviews: ["설정 접근성 검수"],
+			maxImprovementCycles: 3,
+			maxRecoveries: 2,
+		};
+		/* [When] */ await h.start(proposal);
+		/* [Then] */ expect(h.prompts[0]).toContain(proposal.nonGoals[0]);
+		expect(h.prompts[0]).toContain(proposal.successCriteria[0]);
+		expect(h.prompts[0]).toContain(proposal.requiredReviews[0]);
+		expect(h.prompts[0]).toMatch(/보완.*3/);
+		expect(h.prompts[0]).toMatch(/복구.*2/);
+		expect(h.prompts[0]).toMatch(/commit.*push.*Draft PR/);
+		expect((await h.state()).approval).toBeUndefined();
+	});
+});
+
 describe("Draft 강제", () => {
 	it("일반 PR 제안은 승인 대기로 저장하지 않는다", async () => {
 		/* [Given] */ const h = await harness();
@@ -1050,9 +1094,8 @@ setInterval(()=>{},1000);`,
 });
 
 async function fakeRemote(h: Awaited<ReturnType<typeof harness>>, bases = ["stage"]) {
-	const remote = join(h.root, "remote.git");
+	const remote = git(h.repo, "remote", "get-url", "origin");
 	git(h.root, "init", "--bare", remote);
-	git(h.repo, "remote", "add", "origin", remote);
 	for (const base of bases) git(h.repo, "push", "origin", `HEAD:${base}`);
 	const bin = join(h.root, "bin");
 	await mkdir(bin);
@@ -1383,7 +1426,7 @@ const stackPlan = (count = 2) => ({
 	integrationChecks: ["true"],
 	integrationReviews: ["integration"],
 });
-async function stackHarness(count = 2, auto = true) {
+async function stackHarness(count = 2, auto = true, overrides: Record<string, unknown> = {}) {
 	const h = await harness();
 	const fake = await fakeRemote(h);
 	const prs: Record<string, unknown> = {};
@@ -1398,13 +1441,13 @@ const all=JSON.parse(fs.readFileSync(${JSON.stringify(data)},'utf8'));
 process.stdout.write(JSON.stringify(all[a[a.indexOf('--head')+1]]||[]));
 `,
 	);
-	const plan = stackPlan(count);
+	const plan = { ...stackPlan(count), ...overrides };
 	await h.command(`start --stack ${auto ? "--auto " : ""}설정 기능`);
 	const propose = await fake.withGh(() => h.call("stack_propose", plan));
 	expect(propose.isError).not.toBe(true);
 	const prepare = async () => {
 		const state = await h.state();
-		const unit = plan.units[state.stack.index];
+		const unit = state.stack.plan.units[state.stack.index];
 		const parent = state.stack.results.at(-1)?.head ?? state.stack.approval.rootHead;
 		const dispatched = await h.call("dispatch", { role: "prepare", task: "승인 브랜치 준비" });
 		expect(dispatched.isError).not.toBe(true);
@@ -2408,4 +2451,720 @@ describe("기존 커밋 전달 승인과 복원 경계", () => {
 		expect(state.userHold).toBe(true);
 		expect(state.deliveries).toHaveLength(0);
 	});
+});
+
+describe("기존 변경 인수와 사전 검사", () => {
+	it("시작 전 사전 검사는 변경 목록을 반환하고 index와 파일을 보존한다", async () => {
+		/* [Given] */ const h = await harness();
+		await h.hook("session_start", { type: "session_start" });
+		await writeFile(join(h.repo, "new.txt"), "새 작업\n");
+		git(h.repo, "add", "new.txt");
+		await writeFile(join(h.repo, "new.txt"), "보완 작업\n");
+		const index = await readFile(join(h.repo, ".git/index"));
+		const refs = structuredClone(h.refs);
+		/* [When] */ const result = await h.call("preflight");
+		/* [Then] */ expect(result.isError).not.toBe(true);
+		expect((result.details as { eligible: boolean | null }).eligible).toBeNull();
+		expect((result.details as { changes: unknown[] }).changes).toEqual(
+			expect.arrayContaining([expect.objectContaining({ path: "new.txt" })]),
+		);
+		expect(await readFile(join(h.repo, ".git/index"))).toEqual(index);
+		expect(await readFile(join(h.repo, "new.txt"), "utf8")).toBe("보완 작업\n");
+		expect(h.refs).toEqual(refs);
+		expect(h.active()).toContain("workflow_preflight");
+	});
+	it("승인 불가능한 새 계획은 기존 승인과 검사 증거를 보존한다", async () => {
+		/* [Given] */ const h = await harness();
+		await h.approve();
+		await h.call("check");
+		await writeFile(join(h.repo, "file.txt"), "인수할 변경\n");
+		const before = await h.state();
+		/* [When] */ const result = await h.call("propose", { ...spec, endpoint: "commit" });
+		/* [Then] */ expect(result.isError).toBe(true);
+		expect(await h.state()).toEqual(before);
+	});
+	it("UI에서 후보를 보류하면 기존 승인과 검사 증거를 보존한다", async () => {
+		/* [Given] */ const h = await harness();
+		await h.approve();
+		await h.call("check");
+		const before = await h.state();
+		h.select("보류");
+		/* [When] */ await h.call("propose", { ...spec, title: "새 계획" });
+		/* [Then] */ expect(await h.state()).toEqual(before);
+	});
+	it("후보 승인 중 파일이 바뀌어도 기존 승인과 증거를 잃지 않는다", async () => {
+		/* [Given] */ const h = await harness();
+		await h.approve();
+		await h.call("check");
+		const before = await h.state();
+		h.ctx.hasUI = true;
+		h.ctx.ui.select = async () => {
+			await writeFile(join(h.repo, "file.txt"), "승인 중 변경\n");
+			return "승인";
+		};
+		/* [When] */ const result = await h.call("propose", { ...spec, title: "새 계획" });
+		/* [Then] */ expect(result.isError).toBe(true);
+		expect(await h.state()).toEqual(before);
+	});
+	it("여섯 신규 파일을 인수한 뒤 검사와 독립 검수를 거쳐 PR까지 전달한다", async () => {
+		/* [Given] */ const h = await harness();
+		const fake = await fakeRemote(h);
+		const paths = Array.from({ length: 6 }, (_, i) => `ui-${i}.txt`);
+		for (const path of paths) await writeFile(join(h.repo, path), "독립 UI\n");
+		await h.approve({ ...spec, endpoint: "pr", adoptChanges: { paths } });
+		await h.call("check");
+		await h.call("dispatch", { role: "review", task: "인수 산출물 검수" });
+		await h.finish(undefined, { finalOutput: "WORKFLOW_VERDICT: pass" });
+		const dispatched = await h.call("dispatch", { role: "deliver", task: "인수 산출물 전달" });
+		git(h.repo, "add", "-A");
+		git(h.repo, "commit", "-m", "독립 UI");
+		git(h.repo, "push", "origin", "feature/workflow");
+		await fake.openPr();
+		/* [When] */ await fake.withGh(() => h.finish());
+		/* [Then] */ expect(dispatched.isError).not.toBe(true);
+		const state = await h.state();
+		expect(state.phase).toBe("completed");
+		expect(state.approval.adoption.paths).toEqual(paths);
+		expect(state.approval.adoption.changes).toHaveLength(6);
+		expect(state.deliveries.find((d: any) => d.action === "pr").details.url).toBe("https://example.invalid/pr/1");
+	});
+	it.each(["누락", "무관한 추가"])("인수 대상 %s은 제안 단계에서 차단한다", async (kind) => {
+		/* [Given] */ const h = await harness();
+		await writeFile(join(h.repo, "first.txt"), "작업\n");
+		await writeFile(join(h.repo, "second.txt"), "별도 작업\n");
+		await h.command("start 인수");
+		/* [When] */ const result = await h.call("propose", {
+			...spec,
+			endpoint: "commit",
+			adoptChanges: { paths: kind === "누락" ? ["first.txt"] : ["first.txt", "second.txt", "missing.txt"] },
+		});
+		/* [Then] */ expect(result.isError).toBe(true);
+		expect((await h.state()).spec).toBeUndefined();
+	});
+	it.each(["../file.txt", "/tmp/file.txt", "./file.txt", "", "*.txt", "dir//file.txt"])(
+		"잘못된 허용 경로 %s를 거절한다",
+		async (path) => {
+			/* [Given] */ const h = await harness();
+			await writeFile(join(h.repo, "file.txt"), "작업\n");
+			/* [When] */ const result = await h.call("preflight", {
+				spec: { ...spec, endpoint: "commit", adoptChanges: { paths: ["file.txt"], allowedPaths: [path] } },
+			});
+			/* [Then] */ expect((result.details as { eligible: boolean }).eligible).toBe(false);
+		},
+	);
+	it.each(["head", "file", "index", "remote"])("인수 승인 화면 이후 %s 변경을 거절한다", async (kind) => {
+		/* [Given] */ const h = await harness();
+		await fakeRemote(h);
+		await writeFile(join(h.repo, "new.txt"), "작업\n");
+		h.ctx.hasUI = true;
+		h.ctx.ui.select = async () => {
+			if (kind === "head") git(h.repo, "commit", "--allow-empty", "-m", "경합");
+			if (kind === "file") await writeFile(join(h.repo, "new.txt"), "바뀐 작업\n");
+			if (kind === "index") git(h.repo, "add", "new.txt");
+			if (kind === "remote") git(h.repo, "remote", "set-url", "origin", join(h.root, "other.git"));
+			return "승인";
+		};
+		await h.command("start 인수");
+		/* [When] */ const result = await h.call("propose", {
+			...spec,
+			endpoint: "pr",
+			adoptChanges: { paths: ["new.txt"] },
+		});
+		/* [Then] */ expect(result.isError).toBe(true);
+		expect((await h.state()).approval).toBeUndefined();
+	});
+	it("허용 범위 안의 보완은 재승인 없이 증거를 갱신한다", async () => {
+		/* [Given] */ const h = await harness();
+		await writeFile(join(h.repo, "file.txt"), "인수 작업\n");
+		await h.approve({ ...spec, endpoint: "commit", adoptChanges: { paths: ["file.txt"] } });
+		await h.call("check");
+		await h.call("dispatch", { role: "review", task: "검수" });
+		await h.finish(undefined, { finalOutput: "WORKFLOW_VERDICT: pass" });
+		const approval = (await h.state()).approval;
+		await writeFile(join(h.repo, "file.txt"), "보완 작업\n");
+		const stale = await h.call("dispatch", { role: "deliver", task: "전달" });
+		/* [When] */ const checked = await h.call("check");
+		/* [Then] */ expect(stale.isError).toBe(true);
+		expect(checked.isError).not.toBe(true);
+		expect((await h.state()).approval).toEqual(approval);
+		expect((await h.state()).review).toBeUndefined();
+	});
+	it.each(["check", "review", "deliver", "implement"])("범위 밖 변경은 %s에서 차단한다", async (action) => {
+		/* [Given] */ const h = await harness();
+		await writeFile(join(h.repo, "file.txt"), "인수 작업\n");
+		await h.approve({ ...spec, endpoint: "commit", adoptChanges: { paths: ["file.txt"] } });
+		if (["review", "deliver"].includes(action)) await h.call("check");
+		if (action === "deliver") {
+			await h.call("dispatch", { role: "review", task: "검수" });
+			await h.finish(undefined, { finalOutput: "WORKFLOW_VERDICT: pass" });
+		}
+		await writeFile(join(h.repo, "outside.txt"), "승인 외 작업\n");
+		/* [When] */ const result =
+			action === "check" ? await h.call("check") : await h.call("dispatch", { role: action, task: "작업" });
+		/* [Then] */ expect(result.isError).toBe(true);
+		expect(JSON.stringify(result)).toMatch(/범위|경로/);
+	});
+	it("기준 HEAD 이후 커밋된 범위 밖 파일도 검사하지 않는다", async () => {
+		/* [Given] */ const h = await harness();
+		await writeFile(join(h.repo, "file.txt"), "인수 작업\n");
+		await h.approve({ ...spec, endpoint: "commit", adoptChanges: { paths: ["file.txt"] } });
+		await writeFile(join(h.repo, "outside.txt"), "승인 외 작업\n");
+		git(h.repo, "add", "outside.txt");
+		git(h.repo, "commit", "-m", "범위 우회");
+		/* [When] */ const result = await h.call("check");
+		/* [Then] */ expect(result.isError).toBe(true);
+		expect(JSON.stringify(result)).toMatch(/범위|경로/);
+	});
+	it("실제 관리 worker가 남아 있으면 후보를 적용하지 않는다", async () => {
+		/* [Given] */ const h = await harness();
+		await h.approve();
+		const before = await h.state();
+		h.events.on("subagent:managed:v1:request", (raw: any) => {
+			if (raw.type === "inspect") raw.respond({ ok: true, runs: [{ status: "running" }] });
+		});
+		/* [When] */ const result = await h.call("propose", { ...spec, title: "전환" });
+		/* [Then] */ expect(result.isError).toBe(true);
+		expect(await h.state()).toEqual(before);
+	});
+	it("재시작은 인수 증거와 사용자 보류를 보존한다", async () => {
+		/* [Given] */ const h = await harness();
+		await writeFile(join(h.repo, "file.txt"), "인수 작업\n");
+		await h.approve({ ...spec, endpoint: "commit", adoptChanges: { paths: ["file.txt"] } });
+		await h.command("pause");
+		const before = await h.state();
+		const next = await harness(true, { root: h.root, refs: h.refs });
+		/* [When] */ await next.hook("session_start", { type: "session_start" });
+		/* [Then] */ const current = await next.state();
+		expect(current.approval.adoption).toEqual(before.approval.adoption);
+		expect(current.userHold).toBe(true);
+		expect(next.active()).toContain("workflow_preflight");
+	});
+
+	it.each(["head", "file", "index", "remote"])("명령 승인 전 %s 변경도 재제안을 요구한다", async (kind) => {
+		/* [Given] */ const h = await harness();
+		await writeFile(join(h.repo, "file.txt"), "인수 작업\n");
+		await h.start({ ...spec, endpoint: "pr", adoptChanges: { paths: ["file.txt"] } });
+		if (kind === "head") git(h.repo, "commit", "--allow-empty", "-m", "경합");
+		if (kind === "file") await writeFile(join(h.repo, "file.txt"), "바뀐 작업\n");
+		if (kind === "index") git(h.repo, "add", "file.txt");
+		if (kind === "remote") git(h.repo, "remote", "set-url", "origin", join(h.root, "other.git"));
+		/* [When] */ await h.command("approve");
+		/* [Then] */ expect((await h.state()).approval).toBeUndefined();
+		expect(h.messages.join(" ")).toMatch(/승인 화면 이후/);
+	});
+	it.each(["check", "review", "deliver"])("승인 이후 origin 변경을 %s에서 거절한다", async (action) => {
+		/* [Given] */ const h = await harness();
+		await writeFile(join(h.repo, "file.txt"), "인수 작업\n");
+		await h.approve({ ...spec, endpoint: "pr", adoptChanges: { paths: ["file.txt"] } });
+		if (action !== "check") await h.call("check");
+		if (action === "deliver") {
+			await h.call("dispatch", { role: "review", task: "검수" });
+			await h.finish(undefined, { finalOutput: "WORKFLOW_VERDICT: pass" });
+		}
+		git(h.repo, "remote", "set-url", "origin", join(h.root, "other.git"));
+		/* [When] */ const result =
+			action === "check" ? await h.call("check") : await h.call("dispatch", { role: action, task: "작업" });
+		/* [Then] */ expect(result.isError).toBe(true);
+		expect(JSON.stringify(result)).toMatch(/origin/);
+		expect((await h.state()).review).toBeUndefined();
+	});
+	it("보류 상태의 사전 검사는 정본과 index를 쓰지 않는다", async () => {
+		/* [Given] */ const h = await harness();
+		await h.approve();
+		await h.command("pause");
+		const state = await h.state();
+		const stored = await readFile(storedPath(h));
+		const index = await readFile(join(h.repo, ".git/index"));
+		/* [When] */ const result = await h.call("preflight", { spec: { ...spec, endpoint: "commit" } });
+		/* [Then] */ expect(result.isError).not.toBe(true);
+		expect(await h.state()).toEqual(state);
+		expect(await readFile(storedPath(h))).toEqual(stored);
+		expect(await readFile(join(h.repo, ".git/index"))).toEqual(index);
+	});
+	it("검수 중 원격 대상이 바뀌면 pass를 완료 증거로 받지 않는다", async () => {
+		/* [Given] */ const h = await harness();
+		await writeFile(join(h.repo, "file.txt"), "인수 작업\n");
+		await h.approve({ ...spec, endpoint: "pr", adoptChanges: { paths: ["file.txt"] } });
+		await h.call("check");
+		await h.call("dispatch", { role: "review", task: "검수" });
+		git(h.repo, "remote", "set-url", "origin", join(h.root, "other.git"));
+		/* [When] */ await h.finish(undefined, { finalOutput: "WORKFLOW_VERDICT: pass" });
+		/* [Then] */ const state = await h.state();
+		expect(state.control).toBe("blocked");
+		expect(state.review).toBeUndefined();
+		expect(state.attempts.at(-1).reviewInvalidated).toBe(true);
+	});
+});
+
+async function replanHarness(delegated = true, ci = false) {
+	const plan = stackPlan(2);
+	const h = await stackHarness(2, true, {
+		...(delegated ? { replanPolicy: { maxReplans: 2 } } : {}),
+		units: plan.units.map((unit) => ({
+			...unit,
+			...(ci && unit.id === "part-2" ? { ciChecks: ["required-ci"] } : {}),
+			allowedPaths: ["file.txt", "unit-0.txt", "unit-1.txt"],
+		})),
+	});
+	await h.completeUnit();
+	await h.prepare();
+	return h;
+}
+function revisedPlan(state: any) {
+	const plan = structuredClone(state.stack.plan);
+	plan.units[state.stack.index].title = "미전달 단위 보완";
+	plan.units[state.stack.index].checks.push(`printf checked-${plan.units[state.stack.index].checks.length}`);
+	return plan;
+}
+
+describe("스택 suffix 재계획", () => {
+	it("최초 위임 범위의 dirty 인수는 UI 없이 prefix를 보존하고 새 검수로 전체 완료한다", async () => {
+		/* [Given] */ const h = await replanHarness();
+		await h.call("dispatch", { role: "implement", agent: "old-builder", task: "작성 중 구현" });
+		await writeFile(join(h.repo, "unit-1.txt"), "작성 중\n");
+		await h.finish();
+		await h.call("check");
+		await h.review("code");
+		const before = await h.state();
+		const index = await readFile(join(h.repo, ".git/index"));
+		/* [When] */ const result = await h.call("stack_replan", {
+			plan: revisedPlan(before),
+			reason: "현재 구현과 추가 검사 반영",
+			adoptChanges: { paths: ["unit-1.txt"], allowedPaths: before.stack.plan.units[1].allowedPaths },
+		});
+		/* [Then] */ expect(result.isError).not.toBe(true);
+		const after = await h.state();
+		expect(h.prompts).toHaveLength(0);
+		expect(after.stack.results).toEqual(before.stack.results);
+		expect(after.stack.approval).toEqual(before.stack.approval);
+		expect(after.stack.stage).toBe("unit");
+		expect(after.owner.generation).toBe(before.owner.generation + 1);
+		expect(after.planVersion).not.toBe(before.planVersion);
+		expect(after.verification).toBeUndefined();
+		expect(after.reviewResults).toBeUndefined();
+		expect(after.stack.revisions[0]).toMatchObject({ via: "scope", index: 1, previousPlan: before.stack.plan });
+		expect(after.stack.revisions[0].previousExecution.attempts).toEqual(before.attempts);
+		expect(after.stack.revisions[0].previousExecution.verification).toEqual(before.verification);
+		expect(await readFile(join(h.repo, ".git/index"))).toEqual(index);
+		expect(git(h.repo, "rev-parse", "HEAD")).toBe(before.approval.head);
+		expect((await h.call("dispatch", { role: "deliver", task: "이전 증거 전달" })).isError).toBe(true);
+		await writeFile(join(h.repo, "unit-1.txt"), "보완 완료\n");
+		expect((await h.call("check")).isError).not.toBe(true);
+		expect(
+			(await h.call("dispatch", { role: "review", agent: "old-builder", reviewKey: "code", task: "자기 검수" }))
+				.isError,
+		).toBe(true);
+		await h.review("code");
+		await h.review("design");
+		await h.deliver();
+		await h.call("check");
+		expect(
+			(
+				await h.call("dispatch", {
+					role: "review",
+					agent: "old-builder",
+					reviewKey: "integration",
+					task: "통합 자기 검수",
+				})
+			).isError,
+		).toBe(true);
+		await h.fake.withGh(async () => {
+			await h.review("integration");
+			await expect.poll(async () => (await h.state()).phase).toBe("completed");
+		});
+		expect((await h.state()).stack.results[0]).toEqual(before.stack.results[0]);
+	}, 60_000);
+	it.each([
+		"위임 없음",
+		"목표 삭제",
+		"검사 삭제",
+		"검수 삭제",
+		"CI 삭제",
+		"범위 확대",
+		"한도 확대",
+		"요구 제외",
+		"정책 추가",
+	])("%s는 --auto여도 UI 없이 기존 증거를 바꾸지 않는다", async (change) => {
+		/* [Given] */ const h = await replanHarness(!["위임 없음", "정책 추가"].includes(change), change === "CI 삭제");
+		const before = await h.state();
+		const plan = revisedPlan(before);
+		const input: any = { plan, reason: change };
+		if (change === "목표 삭제") plan.successCriteria = ["다른 목표"];
+		if (change === "검사 삭제") plan.units[1].checks = ["printf checked"];
+		if (change === "검수 삭제") plan.units[1].requiredReviews = ["code"];
+		if (change === "CI 삭제") plan.units[1].ciChecks = [];
+		if (change === "범위 확대") plan.units[1].allowedPaths.push("outside/");
+		if (change === "한도 확대") plan.maxImprovementCycles++;
+		if (change === "요구 제외") input.excludedRequirements = ["전체 설정 동작"];
+		if (change === "정책 추가") plan.replanPolicy = { maxReplans: 5 };
+		/* [When] */ const result = await h.call("stack_replan", input);
+		/* [Then] */ expect(result.isError).toBe(true);
+		expect((await h.state()).stack.revisions).toBeUndefined();
+		expect((await h.state()).approval).toEqual(before.approval);
+		expect((await h.state()).stack.planVersion).toBe(before.stack.planVersion);
+	});
+	it("재승인 보류는 계획과 검사 증거를 그대로 보존한다", async () => {
+		/* [Given] */ const h = await replanHarness(false);
+		await h.call("check");
+		const before = await h.state();
+		h.select("보류");
+		/* [When] */ await h.call("stack_replan", { plan: revisedPlan(before), reason: "보완" });
+		/* [Then] */ expect(await h.state()).toEqual(before);
+		expect(h.prompts).toHaveLength(1);
+	});
+	it("사용자 승인된 요구 제외는 완료가 아닌 제외 이력으로 재시작 뒤에도 남는다", async () => {
+		/* [Given] */ const h = await replanHarness(false);
+		const before = await h.state();
+		const plan = revisedPlan(before);
+		plan.successCriteria = ["축소된 설정 동작"];
+		h.select("승인");
+		/* [When] */ const result = await h.call("stack_replan", {
+			plan,
+			reason: "일부 요구 제외",
+			excludedRequirements: ["전체 설정 동작"],
+		});
+		/* [Then] */ expect(result.isError).not.toBe(true);
+		expect((await h.state()).stack.revisions[0]).toMatchObject({ via: "ui", excludedRequirements: ["전체 설정 동작"] });
+		const next = await harness(true, h);
+		await next.hook("session_start", {});
+		expect((await next.state()).error).toBeUndefined();
+		expect((await next.state()).stack.excludedRequirements).toEqual(["전체 설정 동작"]);
+	});
+	it.each(["누락", "범위 밖"])("dirty %s 인수는 자동으로 받아들이지 않는다", async (change) => {
+		/* [Given] */ const h = await replanHarness();
+		await writeFile(join(h.repo, "outside.txt"), "외부 변경\n");
+		const before = await h.state();
+		/* [When] */ const result = await h.call("stack_replan", {
+			plan: revisedPlan(before),
+			reason: "dirty",
+			...(change === "범위 밖" ? { adoptChanges: { paths: ["outside.txt"] } } : {}),
+		});
+		/* [Then] */ expect(result.isError).toBe(true);
+		expect(await h.state()).toEqual(before);
+	});
+	it("복구하지 않은 실패 구현은 재계획으로 지우지 않는다", async () => {
+		/* [Given] */ const h = await replanHarness();
+		await h.call("dispatch", { role: "implement", task: "실패 구현" });
+		await h.finish(undefined, { status: "failed" });
+		const before = await h.state();
+		/* [When] */ const result = await h.call("stack_replan", { plan: revisedPlan(before), reason: "실패 지우기" });
+		/* [Then] */ expect(result.isError).toBe(true);
+		expect(await h.state()).toEqual(before);
+	});
+	it("재계획 예산을 소진해도 새 payload로 위임을 늘리지 못한다", async () => {
+		/* [Given] */ const h = await replanHarness();
+		for (let i = 0; i < 2; i++)
+			expect((await h.call("stack_replan", { plan: revisedPlan(await h.state()), reason: "보완" })).isError).not.toBe(
+				true,
+			);
+		const before = await h.state();
+		/* [When] */ const result = await h.call("stack_replan", { plan: revisedPlan(before), reason: "예산 우회" });
+		/* [Then] */ expect(result.isError).toBe(true);
+		expect(await h.state()).toEqual(before);
+	});
+	it("전달된 prefix 변경은 UI 승인으로도 허용하지 않는다", async () => {
+		/* [Given] */ const h = await replanHarness();
+		const before = await h.state();
+		const plan = revisedPlan(before);
+		plan.units[0].title = "이미 전달된 변경 수정";
+		h.select("승인");
+		/* [When] */ const result = await h.call("stack_replan", { plan, reason: "prefix 변경" });
+		/* [Then] */ expect(result.isError).toBe(true);
+		expect(await h.state()).toEqual(before);
+		expect(h.prompts).toHaveLength(0);
+	});
+	it.each(["파일", "index", "HEAD", "원격", "중단", "abort"])(
+		"재승인 화면 중 %s 변경은 늦은 승인을 적용하지 않는다",
+		async (change) => {
+			/* [Given] */ const h = await replanHarness(false);
+			const before = await h.state();
+			let release: (value: string) => void = () => {};
+			let shown: () => void = () => {};
+			const visible = new Promise<void>((resolve) => {
+				shown = resolve;
+			});
+			h.ctx.hasUI = true;
+			h.ctx.ui.select = async () => {
+				shown();
+				return new Promise<string>((resolve) => {
+					release = resolve;
+				});
+			};
+			const abort = new AbortController();
+			const pending = h.call("stack_replan", { plan: revisedPlan(before), reason: "UI 대기" }, abort.signal);
+			const settled = Promise.allSettled([pending]);
+			try {
+				await visible;
+				/* [When] */ if (change === "파일") await writeFile(join(h.repo, "file.txt"), "승인 중 변경\n");
+				if (change === "index") {
+					await writeFile(join(h.repo, "file.txt"), "index 변경\n");
+					git(h.repo, "add", "file.txt");
+				}
+				if (change === "HEAD") git(h.repo, "commit", "--allow-empty", "-m", "승인 중 커밋");
+				if (change === "원격") git(h.repo, "remote", "set-url", "origin", join(h.root, "missing.git"));
+				if (change === "중단") await h.command("pause");
+				if (change === "abort") abort.abort();
+			} finally {
+				release("승인");
+				await settled;
+			}
+			/* [Then] */ expect((await pending).isError).toBe(true);
+			expect((await h.state()).stack).toEqual(before.stack);
+			expect((await h.state()).approval).toEqual(before.approval);
+			if (["중단", "abort"].includes(change)) {
+				expect((await h.state()).userHold).toBe(true);
+				expect((await h.state()).control).toBe("paused");
+			}
+		},
+	);
+});
+
+describe("스택 재계획 복구·범위 경계", () => {
+	it.each(["인수 파일", "보완 범위"])("새 단위 범위 밖 %s는 기존 증거를 보존하고 거절한다", async (kind) => {
+		/* [Given] */ const h = await replanHarness();
+		await writeFile(join(h.repo, "unit-1.txt"), "인수할 내용\n");
+		await h.call("check");
+		const before = await h.state();
+		const index = await readFile(join(h.repo, ".git/index"));
+		const plan = revisedPlan(before);
+		plan.units[1].allowedPaths = kind === "인수 파일" ? ["file.txt"] : ["unit-1.txt"];
+		h.select("승인");
+		/* [When] */ const result = await h.call("stack_replan", {
+			plan,
+			reason: "단위 범위를 좁혀 인수",
+			adoptChanges: { paths: ["unit-1.txt"], allowedPaths: before.stack.plan.units[1].allowedPaths },
+		});
+		/* [Then] */ expect(result.isError).toBe(true);
+		expect(JSON.stringify(result)).toMatch(/범위/);
+		expect(await h.state()).toEqual(before);
+		expect(await readFile(join(h.repo, ".git/index"))).toEqual(index);
+		expect(await readFile(join(h.repo, "unit-1.txt"), "utf8")).toBe("인수할 내용\n");
+		expect(h.prompts).toHaveLength(0);
+	});
+	it("이미 승인받은 변경 인수는 현재 실행과 전달된 prefix 모두 재시작으로 복원한다", async () => {
+		/* [Given] */ const h = await replanHarness();
+		await writeFile(join(h.repo, "unit-1.txt"), "인수할 내용\n");
+		const before = await h.state();
+		await h.call("stack_replan", {
+			plan: revisedPlan(before),
+			reason: "변경 인수",
+			adoptChanges: { paths: ["unit-1.txt"], allowedPaths: before.stack.plan.units[1].allowedPaths },
+		});
+		const next = await harness(true, h);
+		await next.hook("session_start", {});
+		await h.fake.withGh(() => next.command("resume"));
+		/* [When] */ const result = await next.call("check");
+		/* [Then] */ expect(result.isError).not.toBe(true);
+		expect((await next.state()).approval.adoption.paths).toEqual(["unit-1.txt"]);
+		for (const key of ["code", "design"]) {
+			expect((await next.call("dispatch", { role: "review", reviewKey: key, task: "독립 검수" })).isError).not.toBe(
+				true,
+			);
+			await next.finish(undefined, { finalOutput: "WORKFLOW_VERDICT: pass" });
+		}
+		/* 전달 worker 경계는 같은 실제 임시 Git에서 수행한다. */
+		await next.call("dispatch", { role: "deliver", task: "전달" });
+		const reviewed = await next.state();
+		git(h.repo, "add", "-A");
+		git(h.repo, "commit", "-m", "인수 결과 전달");
+		git(h.repo, "push", "origin", reviewed.approval.branch);
+		const data = join(h.root, "stack-prs.json");
+		const prs = JSON.parse(await readFile(data, "utf8"));
+		prs[reviewed.approval.branch] = [
+			{
+				url: "https://example.invalid/pr/2",
+				isDraft: true,
+				baseRefName: reviewed.spec.prBase,
+				baseRefOid: reviewed.approval.head,
+				headRefName: reviewed.approval.branch,
+				headRefOid: git(h.repo, "rev-parse", "HEAD"),
+			},
+		];
+		await writeFile(data, JSON.stringify(prs));
+		await h.fake.withGh(() => next.finish());
+		const restored = await harness(true, h);
+		await restored.hook("session_start", {});
+		expect((await restored.state()).error).toBeUndefined();
+		expect((await restored.state()).stack.results[1].execution.approval.adoption.paths).toEqual(["unit-1.txt"]);
+	}, 60_000);
+	it("재계획 후 허용 범위 밖 파일은 검사와 전달에 포함하지 않는다", async () => {
+		/* [Given] */ const h = await replanHarness();
+		await writeFile(join(h.repo, "unit-1.txt"), "인수\n");
+		const before = await h.state();
+		await h.call("stack_replan", {
+			plan: revisedPlan(before),
+			reason: "인수",
+			adoptChanges: { paths: ["unit-1.txt"] },
+		});
+		await writeFile(join(h.repo, "outside.txt"), "승인 외\n");
+		/* [When] */ const result = await h.call("check");
+		/* [Then] */ expect(result.isError).toBe(true);
+		expect((await h.state()).verification).toBeUndefined();
+		expect((await h.call("dispatch", { role: "deliver", task: "범위 외 전달" })).isError).toBe(true);
+	});
+	it("기존 단위 허용 범위가 없으면 dirty 인수에 실제 UI 승인이 필요하다", async () => {
+		/* [Given] */ const h = await stackHarness(1, true, { replanPolicy: { maxReplans: 2 } });
+		await h.prepare();
+		await writeFile(join(h.repo, "file.txt"), "작성 중\n");
+		const before = await h.state();
+		/* [When] */ const result = await h.call("stack_replan", {
+			plan: revisedPlan(before),
+			reason: "범위 없는 변경",
+			adoptChanges: { paths: ["file.txt"] },
+		});
+		/* [Then] */ expect(result.isError).toBe(true);
+		expect(await h.state()).toEqual(before);
+	});
+	it("prepare 전 재계획도 고정 부모를 유지하고 실제 관리 prepare를 요구한다", async () => {
+		/* [Given] */ const h = await stackHarness(2, true, { replanPolicy: { maxReplans: 2 } });
+		await h.completeUnit();
+		const before = await h.state();
+		/* [When] */ const result = await h.call("stack_replan", {
+			plan: revisedPlan(before),
+			reason: "다음 단위 준비 전 보완",
+		});
+		/* [Then] */ expect(result.isError).not.toBe(true);
+		expect((await h.state()).stack.stage).toBe("preparing");
+		expect(git(h.repo, "branch", "--show-current")).toBe(before.stack.results[0].branch);
+		expect((await h.state()).approval.head).toBe(before.stack.results[0].head);
+		expect((await h.call("dispatch", { role: "implement", task: "prepare 생략" })).isError).toBe(true);
+		await h.prepare();
+		expect((await h.state()).stack.stage).toBe("unit");
+	});
+	it("관리 prepare 기록 없는 외부 동명 브랜치는 재계획으로 수용하지 않는다", async () => {
+		/* [Given] */ const h = await stackHarness(1, true, { replanPolicy: { maxReplans: 2 } });
+		const before = await h.state();
+		git(h.repo, "switch", "-c", before.stack.plan.units[0].branch, before.stack.approval.rootHead);
+		/* [When] */ const result = await h.call("stack_replan", { plan: revisedPlan(before), reason: "브랜치 재사용" });
+		/* [Then] */ expect(result.isError).toBe(true);
+		expect(await h.state()).toEqual(before);
+	});
+	it("복구한 실패와 개선 횟수는 새 실행 세대로 넘어가도 유지한다", async () => {
+		/* [Given] */ const h = await replanHarness();
+		await h.call("dispatch", { role: "implement", agent: "failed-builder", task: "실패 구현" });
+		await h.finish(undefined, { status: "failed" });
+		await h.call("recover", {
+			attemptId: (await h.state()).attempts.at(-1).id,
+			assessment: "partial",
+			notes: "실제 파일 확인",
+		});
+		await h.call("check");
+		await h.review("code", "changes-requested");
+		const before = await h.state();
+		/* [When] */ const result = await h.call("stack_replan", { plan: revisedPlan(before), reason: "복구 후 보완" });
+		/* [Then] */ expect(result.isError).not.toBe(true);
+		expect((await h.state()).improvementCycles).toBe(1);
+		expect((await h.state()).recoveries).toBe(1);
+		expect((await h.state()).stack.revisions[0].previousExecution.attempts).toEqual(before.attempts);
+		await h.call("check");
+		expect(
+			(
+				await h.call("dispatch", {
+					role: "review",
+					reviewKey: "code",
+					agent: "failed-builder",
+					task: "과거 실패 자기 검수",
+				})
+			).isError,
+		).toBe(true);
+	});
+	it.each(["worker", "inspect", "hold", "integration", "budget"])(
+		"%s 경계는 재계획으로 초기화하지 않는다",
+		async (boundary) => {
+			/* [Given] */ const h = await replanHarness();
+			if (boundary === "worker") await h.call("dispatch", { role: "implement", task: "실행 중" });
+			if (boundary === "inspect")
+				h.events.on("subagent:managed:v1:request", (raw: any) => {
+					if (raw.type === "inspect") raw.respond({ ok: true, runs: [{ status: "running", abortPending: true }] });
+				});
+			if (boundary === "hold") await h.command("pause");
+			if (boundary === "integration") {
+				await writeFile(join(h.repo, "unit-1.txt"), "최종 구현\n");
+				await h.call("check");
+				await h.review("code");
+				await h.review("design");
+				await h.deliver();
+			}
+			if (boundary === "budget") {
+				for (let i = 0; i < 3; i++) {
+					await h.call("check");
+					await h.review("code", "changes-requested");
+				}
+			}
+			const before = await h.state();
+			const plan = boundary === "integration" ? before.stack.plan : revisedPlan(before);
+			/* [When] */ const result = await h.call("stack_replan", { plan, reason: "실행 제약 우회" });
+			/* [Then] */ expect(result.isError).toBe(true);
+			expect(await h.state()).toEqual(before);
+		},
+	);
+	it("원격 부모가 변경돼도 실패한 후보는 기존 계획과 결과를 수정하지 않는다", async () => {
+		/* [Given] */ const h = await replanHarness();
+		const before = await h.state();
+		const root = before.stack.results[0];
+		const replacement = git(h.repo, "commit-tree", `${root.head}^{tree}`, "-p", root.head, "-m", "외부 부모 변경");
+		git(h.repo, "push", "origin", `${replacement}:refs/heads/${root.branch}`);
+		/* [When] */ const result = await h.call("stack_replan", {
+			plan: revisedPlan(before),
+			reason: "부모 변경 후 계속",
+		});
+		/* [Then] */ expect(result.isError).toBe(true);
+		expect(await h.state()).toEqual(before);
+	});
+	it("재승인으로 suffix PR을 추가할 수 있지만 최초 위임의 범위를 사후 확장하지 않는다", async () => {
+		/* [Given] */ const h = await replanHarness();
+		const before = await h.state();
+		const plan = revisedPlan(before);
+		plan.units.push({ ...plan.units[1], id: "part-3", branch: "feature/stack-3" });
+		h.select("승인");
+		/* [When] */ const result = await h.call("stack_replan", { plan, reason: "추가 PR 권한" });
+		/* [Then] */ expect(result.isError).not.toBe(true);
+		expect((await h.state()).stack.revisions[0].via).toBe("ui");
+		expect((await h.state()).stack.approval.initialPlan).toEqual(before.stack.plan);
+		h.ctx.hasUI = false;
+		expect(
+			(await h.call("stack_replan", { plan: revisedPlan(await h.state()), reason: "사후 위임 우회" })).isError,
+		).toBe(true);
+	});
+	it.each([0, 6, 1.5])("재계획 한도 %s는 최초 승인하지 않는다", async (maxReplans) => {
+		/* [Given] */ const h = await harness();
+		await h.command("start --stack --auto 계획");
+		/* [When] */ const result = await h.call("stack_propose", { ...stackPlan(), replanPolicy: { maxReplans } });
+		/* [Then] */ expect(result.isError).toBe(true);
+		expect((await h.state()).stack).toBeUndefined();
+	});
+	it.each(["src/../", "/absolute", "src/*", "src//"])("허용 경로 %s는 최초 스택 승인하지 않는다", async (path) => {
+		/* [Given] */ const h = await harness();
+		await h.command("start --stack --auto 계획");
+		const plan = stackPlan(1);
+		/* [When] */ const result = await h.call("stack_propose", {
+			...plan,
+			units: [{ ...plan.units[0], allowedPaths: [path] }],
+		});
+		/* [Then] */ expect(result.isError).toBe(true);
+		expect((await h.state()).stack).toBeUndefined();
+	});
+});
+
+it("명시하지 않은 성공 조건 삭제는 UI 승인이 있어도 제외 이력 없이 적용하지 않는다", async () => {
+	/* [Given] */ const h = await replanHarness();
+	const before = await h.state();
+	const plan = revisedPlan(before);
+	plan.successCriteria = ["일부 성공만 검증"];
+	h.select("승인");
+	/* [When] */ const result = await h.call("stack_replan", { plan, reason: "제외 목록 없이 축소" });
+	/* [Then] */ expect(result.isError).toBe(true);
+	expect(await h.state()).toEqual(before);
+	expect(h.prompts).toHaveLength(0);
+});
+
+it("clean 재계획 이후에도 단위 허용 경로 밖 파일을 검사에 포함하지 않는다", async () => {
+	/* [Given] */ const h = await replanHarness();
+	const before = await h.state();
+	await h.call("stack_replan", { plan: revisedPlan(before), reason: "clean 보완 계획" });
+	await writeFile(join(h.repo, "outside.txt"), "범위 외 구현\n");
+	/* [When] */ const result = await h.call("check");
+	/* [Then] */ expect(result.isError).toBe(true);
+	expect((await h.state()).spec.adoptChanges).toBeUndefined();
+	expect((await h.state()).verification).toBeUndefined();
 });

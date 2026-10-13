@@ -127,6 +127,8 @@ export async function fingerprint(repo: string): Promise<string> {
 		}
 		const env = { ...process.env, GIT_INDEX_FILE: index };
 		await mustRun(repo, "git", ["add", "-A"], env);
+		/* 삭제·신규 파일을 반영한 다음 stat 캐시와 무관하게 남은 파일을 다시 읽는다. */
+		await mustRun(repo, "git", ["add", "--renormalize", "-u"], env);
 		return await mustRun(repo, "git", ["write-tree"], env);
 	} finally {
 		await rm(dir, { recursive: true, force: true });
@@ -139,7 +141,7 @@ export async function snapshot(cwd: string): Promise<Snapshot> {
 		branch: await mustRun(repoRoot, "git", ["rev-parse", "--abbrev-ref", "HEAD"]),
 		head: await mustRun(repoRoot, "git", ["rev-parse", "HEAD"]),
 		fingerprint: await fingerprint(repoRoot),
-		statusShort: await mustRun(repoRoot, "git", ["status", "--short"]),
+		statusShort: await mustRun(repoRoot, "git", ["status", "--short"], { ...process.env, GIT_OPTIONAL_LOCKS: "0" }),
 	};
 }
 export function statePath(agentDir: string, repoKey: string, workflowId: string): string {
@@ -198,6 +200,23 @@ const choices = (values: string[]) => Type.Union(values.map((value) => Type.Lite
 const count = Type.Integer({ minimum: 0 });
 const text = Type.String();
 const snapshotSchema = Type.Object({ repoRoot: text, branch: text, head: text, fingerprint: text, statusShort: text });
+const remoteTargetSchema = Type.Object({ identity: text, display: text, pushDisplay: text });
+const changeSchema = Type.Object({ path: text, status: text, originalPath: Type.Optional(text) });
+const workspaceEvidenceSchema = Type.Object({
+	...snapshotSchema.properties,
+	indexFingerprint: text,
+	changes: Type.Array(changeSchema),
+	summary: text,
+	remote: Type.Optional(remoteTargetSchema),
+	signature: text,
+});
+const adoptionEvidenceSchema = Type.Object({
+	paths: Type.Array(text),
+	allowedPaths: Type.Array(text),
+	changes: Type.Array(changeSchema),
+	workspace: workspaceEvidenceSchema,
+});
+
 const attemptSchema = Type.Object({
 	id: Type.String({ pattern: "^[a-f0-9-]{36}$" }),
 	role: choices(["implement", "review", "research", "deliver", "prepare"]),
@@ -245,17 +264,21 @@ const singleSchema = Type.Object({
 	spec: Type.Optional(
 		Type.Object({
 			...specSchema.properties,
+			revisionId: Type.Optional(text),
 			prDraft: Type.Literal(true),
 			maxImprovementCycles: Type.Integer({ minimum: 1, maximum: 5 }),
 			maxRecoveries: Type.Integer({ minimum: 0, maximum: 3 }),
 		}),
 	),
 	planVersion: Type.Optional(text),
+	proposalWorkspace: Type.Optional(workspaceEvidenceSchema),
 	approval: Type.Optional(
 		Type.Object({
 			planVersion: text,
 			at: text,
 			via: choices(["ui", "command", "auto"]),
+			adoption: Type.Optional(adoptionEvidenceSchema),
+			target: Type.Optional(remoteTargetSchema),
 			repoRoot: text,
 			branch: text,
 			head: text,
@@ -332,6 +355,8 @@ const persistedSchema = Type.Object({
 					rootFingerprint: text,
 					sourceBranch: text,
 					sourceHead: text,
+					initialPlan: Type.Optional(stackPlanSchema),
+					target: Type.Optional(remoteTargetSchema),
 				}),
 			),
 			results: Type.Array(
@@ -347,6 +372,22 @@ const persistedSchema = Type.Object({
 					execution: unitExecutionSchema,
 				}),
 			),
+			revisions: Type.Optional(
+				Type.Array(
+					Type.Object({
+						at: text,
+						reason: text,
+						via: choices(["scope", "ui", "command"]),
+						fromPlanVersion: text,
+						toPlanVersion: text,
+						previousPlan: stackPlanSchema,
+						previousExecution: unitExecutionSchema,
+						index: count,
+						excludedRequirements: Type.Array(text),
+					}),
+				),
+			),
+			excludedRequirements: Type.Optional(Type.Array(text)),
 			invalidatedFrom: Type.Optional(count),
 		}),
 	),
@@ -382,6 +423,7 @@ function validStack(state: Workflow): boolean {
 				result.base === (previous?.branch ?? stack.plan.rootBase) &&
 				result.parentHead === (previous?.head ?? stack.approval?.rootHead) &&
 				execution.spec &&
+				validAdoption(execution) &&
 				execution.planVersion === planVersion(execution.spec) &&
 				execution.approval?.planVersion === execution.planVersion &&
 				execution.approval.branch === result.branch &&
@@ -394,6 +436,7 @@ function validStack(state: Workflow): boolean {
 		})
 	)
 		return false;
+	if (!validStackRevisions(stack)) return false;
 	const unit = stack.plan.units[stack.index];
 	const previous = stack.results.at(-1);
 	return (
@@ -407,6 +450,28 @@ function validStack(state: Workflow): boolean {
 			JSON.stringify(unit?.requiredReviews ?? stack.plan.integrationReviews) &&
 		(!unit || state.spec.prBase === (previous?.branch ?? stack.plan.rootBase))
 	);
+}
+function validStackRevisions(stack: NonNullable<Workflow["stack"]>): boolean {
+	if (stack.approval?.initialPlan && stack.approval?.initialPlan.rootBase !== stack.plan.rootBase) return false;
+	if (stack.revisions) {
+		const initialBudget = stack.approval?.initialPlan?.replanPolicy?.maxReplans;
+		if (initialBudget !== undefined && stack.revisions.length > initialBudget) return false;
+		for (const [index, revision] of stack.revisions.entries()) {
+			if (
+				revision.index > stack.index ||
+				revision.index >= revision.previousPlan.units.length ||
+				revision.fromPlanVersion !== stackVersion(revision.previousPlan) ||
+				revision.toPlanVersion !== (stack.revisions[index + 1]?.fromPlanVersion ?? stack.planVersion) ||
+				(revision.previousExecution.spec &&
+					revision.previousExecution.planVersion !== planVersion(revision.previousExecution.spec)) ||
+				!validAdoption(revision.previousExecution)
+			)
+				return false;
+		}
+		const excluded = [...new Set(stack.revisions.flatMap((revision) => revision.excludedRequirements))];
+		if (JSON.stringify(excluded) !== JSON.stringify(stack.excludedRequirements ?? [])) return false;
+	}
+	return true;
 }
 function validWorkflow(value: unknown): value is Workflow {
 	if (!Value.Check(persistedSchema, value)) return false;
@@ -426,6 +491,8 @@ function validWorkflow(value: unknown): value is Workflow {
 			? state.userHold === undefined && state.controlRevision === undefined
 			: typeof state.userHold === "boolean" && state.controlRevision !== undefined) &&
 		validStack(state) &&
+		validAdoption(state) &&
+		(!state.spec?.adoptChanges || state.mode !== "stack" || state.stack?.stage === "unit") &&
 		(!state.spec?.deliveryMode || (state.mode !== "stack" && state.spec.endpoint === "pr")) &&
 		(state.stack?.results.every((result) => !result.execution.spec?.deliveryMode) ?? true) &&
 		spec &&
@@ -433,5 +500,25 @@ function validWorkflow(value: unknown): value is Workflow {
 		attempts &&
 		state.lastContinuationSeq <= state.seq &&
 		(state.control !== "stopping" || !!state.stopTarget)
+	);
+}
+
+function validAdoption(state: Pick<Workflow, "spec" | "approval">): boolean {
+	return (
+		(!state.spec?.adoptChanges ||
+			(state.spec.endpoint !== "verify" &&
+				!state.spec.deliveryMode &&
+				(!state.approval || !!state.approval.adoption))) &&
+		(!state.approval?.adoption ||
+			(!!state.spec?.adoptChanges &&
+				JSON.stringify(state.approval.adoption.paths) === JSON.stringify(state.spec.adoptChanges.paths) &&
+				JSON.stringify(state.approval.adoption.allowedPaths) ===
+					JSON.stringify(state.spec.adoptChanges.allowedPaths ?? state.spec.adoptChanges.paths) &&
+				state.approval.adoption.workspace.repoRoot === state.approval.repoRoot &&
+				state.approval.adoption.workspace.branch === state.approval.branch &&
+				state.approval.adoption.workspace.head === state.approval.head &&
+				state.approval.adoption.workspace.fingerprint === state.approval.fingerprint &&
+				(state.spec.endpoint !== "pr" ||
+					state.approval.target?.identity === state.approval.adoption.workspace.remote?.identity)))
 	);
 }

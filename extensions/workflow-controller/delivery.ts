@@ -1,3 +1,4 @@
+import { assertAdoptionScope, assertRemoteTarget } from "./preflight.ts";
 import { mustRun, run, snapshot } from "./io.ts";
 import type { Delivery, Snapshot, Workflow } from "./model.ts";
 
@@ -60,12 +61,24 @@ function assertExistingCommit(state: Workflow, current: Snapshot, tree: string):
 		throw new Error("기존 커밋이 승인된 HEAD·검사·필수 검수 증거와 다릅니다.");
 }
 
+function assertUnchangedDelivery(current: Snapshot, latest: Snapshot, tree: string): void {
+	if (
+		latest.branch !== current.branch ||
+		latest.head !== current.head ||
+		latest.fingerprint !== tree ||
+		latest.statusShort
+	)
+		throw new Error("전달 확인 도중 검수된 커밋·작업 트리가 변경됐습니다.");
+}
+
 /* 전달 worker의 보고 대신 실제 커밋·원격·PR 상태로 전달 여부를 판정한다. 승인과 어긋나면 예외를 던진다. */
 export async function inspectDelivery(state: Workflow, at: string): Promise<DeliveryResult> {
 	const approval = state.approval;
 	if (!state.spec || !approval || state.spec.endpoint === "verify")
 		throw new Error("승인된 전달 종료 지점이 아닙니다.");
 	const current = await snapshot(state.repoRoot);
+	await assertRemoteTarget(state.repoRoot, approval.target);
+	await assertAdoptionScope(state, current);
 	if (current.branch !== approval.branch) throw new Error("승인된 브랜치가 아닙니다.");
 	const reused = state.spec.deliveryMode === "existing-commit";
 
@@ -85,7 +98,12 @@ export async function inspectDelivery(state: Workflow, at: string): Promise<Deli
 	if (tree !== state.review?.fingerprint || current.fingerprint !== tree || current.statusShort)
 		throw new Error("전달 커밋이 승인 커밋 위의 검수 내용과 다르거나 커밋되지 않은 변경이 남았습니다.");
 	record(state, "commit", { head: current.head, base: approval.head, ...(reused ? { reused: true } : {}) }, at);
-	if (state.spec.endpoint === "commit") return { complete: true };
+	if (state.spec.endpoint === "commit") {
+		const latest = await snapshot(state.repoRoot);
+		await assertAdoptionScope(state, latest);
+		assertUnchangedDelivery(current, latest, tree);
+		return { complete: true };
+	}
 	const remote = await mustRun(state.repoRoot, "git", ["ls-remote", "origin", `refs/heads/${current.branch}`]);
 	if (remote.split(/\s/)[0] !== current.head)
 		return { complete: false, reason: "원격 브랜치가 전달 커밋을 가리키지 않습니다." };
@@ -112,16 +130,9 @@ export async function inspectDelivery(state: Workflow, at: string): Promise<Deli
 		pr.headRefOid !== current.head
 	)
 		throw new Error("PR의 base·Draft·head가 승인·전달 커밋과 다릅니다.");
-	if (reused) {
-		const latest = await snapshot(state.repoRoot);
-		if (
-			latest.branch !== current.branch ||
-			latest.head !== current.head ||
-			latest.fingerprint !== tree ||
-			latest.statusShort
-		)
-			throw new Error("전달 확인 도중 승인된 기존 커밋·작업 트리가 변경됐습니다.");
-	}
+	assertUnchangedDelivery(current, await snapshot(state.repoRoot), tree);
+	await assertRemoteTarget(state.repoRoot, approval.target);
+	await assertAdoptionScope(state, await snapshot(state.repoRoot));
 	record(state, "pr", { head: current.head, url: pr.url, base: pr.baseRefName }, at);
 	return { complete: true };
 }

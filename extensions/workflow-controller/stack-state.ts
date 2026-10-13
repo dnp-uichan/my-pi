@@ -21,6 +21,7 @@ export function normalizeStackPlan(input: StackPlanInput): StackPlan {
 			checks: strings(unit.checks),
 			requiredReviews: strings(unit.requiredReviews),
 			ciChecks: strings(unit.ciChecks),
+			...(unit.allowedPaths ? { allowedPaths: [...unit.allowedPaths] } : {}),
 		})),
 		maxImprovementCycles: input.maxImprovementCycles ?? 3,
 		maxRecoveries: input.maxRecoveries ?? 2,
@@ -28,7 +29,7 @@ export function normalizeStackPlan(input: StackPlanInput): StackPlan {
 }
 export const stackVersion = (plan: StackPlan) => hash(JSON.stringify(plan));
 
-function execution(state: Workflow): UnitExecution {
+export function execution(state: Workflow): UnitExecution {
 	return structuredClone({
 		spec: state.spec,
 		planVersion: state.planVersion,
@@ -74,6 +75,7 @@ export function activateStackUnit(state: Workflow, at: string): void {
 		branch: unit?.branch ?? base,
 		head: parentHead,
 		fingerprint,
+		...(stack.approval.target ? { target: stack.approval.target } : {}),
 	};
 	state.attempts = [];
 	state.checks = [];
@@ -120,11 +122,17 @@ export function stackInstruction(state: Workflow): string | undefined {
 		return "workflow_stack_propose로 선형 PR 계획·필수 검수·CI·전체 검사를 제안하세요. 임의 브랜치 변경 금지.";
 	if (stack.invalidatedFrom !== undefined)
 		return "스택의 부모 커밋이 변경됐습니다. 자동 restack하지 말고 사용자에게 영향 범위를 보고하세요.";
+	const excluded = stack.excludedRequirements?.length
+		? `\n사용자 승인된 제외 요구(완료 아님): ${stack.excludedRequirements.join(", ")}`
+		: "";
 	if (stack.stage === "preparing")
-		return `스택 ${stack.index + 1}/${stack.plan.units.length}: workflow_dispatch role prepare로 승인 브랜치를 준비하세요.`;
+		return `스택 ${stack.index + 1}/${stack.plan.units.length}: workflow_dispatch role prepare로 승인 브랜치를 준비하세요.${excluded}`;
 	if (stack.stage === "integration")
-		return "전체 스택 통합 단계입니다. workflow_check 및 계획의 integrationReviews별 reviewKey 검수를 수행하세요. 파일 수정·추가 전달 금지.";
+		return (
+			"전체 스택 통합 단계입니다. workflow_check 및 계획의 integrationReviews별 reviewKey 검수를 수행하세요. 파일 수정·추가 전달 금지." +
+			excluded
+		);
 	if (state.phase === "reviewing")
-		return `필수 검수 ${state.spec?.requiredReviews?.join(", ")}를 각각 reviewKey로 지정해 완료하세요.`;
-	return undefined;
+		return `필수 검수 ${state.spec?.requiredReviews?.join(", ")}를 각각 reviewKey로 지정해 완료하세요.${excluded}`;
+	return excluded || undefined;
 }

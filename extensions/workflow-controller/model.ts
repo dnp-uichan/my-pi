@@ -1,10 +1,20 @@
+import type { AdoptionEvidence, RemoteTarget, WorkspaceEvidence } from "./preflight.ts";
 import type { StackState } from "./stack-model.ts";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
 import { Type, type Static } from "typebox";
 
+export const adoptChangesSchema = Type.Object(
+	{
+		paths: Type.Array(Type.String(), { minItems: 1, uniqueItems: true }),
+		allowedPaths: Type.Optional(Type.Array(Type.String(), { minItems: 1, uniqueItems: true })),
+	},
+	{ additionalProperties: false },
+);
+
 export const specSchema = Type.Object({
+	adoptChanges: Type.Optional(adoptChangesSchema),
 	title: Type.String({ minLength: 1 }),
 	objective: Type.String({ minLength: 1 }),
 	nonGoals: Type.Array(Type.String()),
@@ -24,8 +34,14 @@ export const specSchema = Type.Object({
 	maxImprovementCycles: Type.Optional(Type.Integer({ minimum: 1, maximum: 5 })),
 	maxRecoveries: Type.Optional(Type.Integer({ minimum: 0, maximum: 3 })),
 });
-export type Spec = Omit<Required<Static<typeof specSchema>>, "prBase" | "requiredReviews" | "deliveryMode"> & {
+export type Spec = Omit<
+	Required<Static<typeof specSchema>>,
+	"prBase" | "requiredReviews" | "deliveryMode" | "adoptChanges"
+> & {
+	/* 재계획 실행 세대를 분리하는 확장 생성 ID. 사용자 계획 입력으로 정규화하지 않는다. */
+	revisionId?: string;
 	prBase?: string;
+	adoptChanges?: Static<typeof adoptChangesSchema>;
 	deliveryMode?: "existing-commit";
 	requiredReviews?: string[];
 };
@@ -88,10 +104,13 @@ export type Workflow = {
 	reason?: string;
 	spec?: Spec;
 	planVersion?: string;
+	proposalWorkspace?: WorkspaceEvidence;
 	approval?: {
 		planVersion: string;
 		at: string;
 		via: "ui" | "command" | "auto";
+		adoption?: AdoptionEvidence;
+		target?: RemoteTarget;
 		repoRoot: string;
 		branch: string;
 		head: string;
@@ -135,6 +154,7 @@ export function normalizeSpec(input: Static<typeof specSchema>): Spec {
 		successCriteria: input.successCriteria.map((s) => s.trim()),
 		checks: input.checks.map((s) => s.trim()),
 		endpoint: input.endpoint,
+		...(input.adoptChanges ? { adoptChanges: structuredClone(input.adoptChanges) } : {}),
 		...(input.deliveryMode ? { deliveryMode: input.deliveryMode } : {}),
 		prDraft: input.prDraft ?? true,
 		...(input.requiredReviews ? { requiredReviews: input.requiredReviews.map((key) => key.trim()) } : {}),

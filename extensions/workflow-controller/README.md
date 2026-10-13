@@ -1,10 +1,16 @@
 # workflow-controller
 
-Pi 메인이 판단과 분담을 맡고, 이 확장은 승인·상태·검사 증거·독립 검수·중단·전달 조건을 관리한다. subagent 관리 API v1이 없으면 시작하지 않는다.
+Pi 메인이 조사·인터뷰·판단·분담을 맡고, 이 확장은 기존 승인·검사·독립 검수·중단·전달 조건을 관리한다. 기본 운영은 **조사와 필요한 인터뷰 → 최종 계획 한 번 승인 → 구현·보완·검증·Draft PR 전달 → 사용자가 PR에서 리뷰**다. 인터뷰 전용 단계·저장 상태·명령은 추가하지 않는다. subagent 관리 API v1이 없으면 시작하지 않는다.
 
-- 메인이 `workflow_start({ goal: "목표" })`로 읽기 전용 조사와 계획 제안을 시작한다. 사용자가 `/workflow start <목표>`로 직접 시작할 수도 있다.
+인터뷰 깊이는 구현 난이도가 아니라 **남은 불확실성과 실패 영향**으로 정한다. 코드·문서·조회 도구로 확인할 사실과 기존 패턴의 기술적 선택은 메인이 해결한다. 목표가 명확하면 질문 없이, 일부만 불명확하면 관련 질문을 묶어서, 정책·의존관계가 얽히면 해당 부분만 깊게 확인한다. 이미 합의한 답을 다시 묻거나 고정 질문지를 모두 채우지 않는다.
+
+목표·제외 범위·성공 기준·수정 범위·허용 대안·실패 시 대응·보완/복구 한도와 전달 권한이 정해지면 인터뷰를 끝낸다. 합의는 기존 `objective`·`nonGoals`·`successCriteria`·검사·검수·한도 필드에 담는다. 별도 인터뷰 문서는 필요 없다. 최종 요약을 본문으로 설명한 다음 기존 계획 승인 UI에서 한 번 승인받고, 같은 합의를 별도 폼으로 반복하지 않는다. 사용자가 `verify`·`commit` 종료를 명시하지 않았다면 메인은 `endpoint: "pr"`를 제안한다. 이는 제안 기준이며 스키마 기본값이나 자동 실행 권한이 아니다. 저장소·head·base와 commit·push·Draft PR 권한은 승인 대상이다.
+
+Stacked PR은 각 PR의 결과·제외 범위·부모 관계·검토 순서·검증과 전체 통합 완료 기준까지 처음에 합의한다. 실행 중 조정 권한은 기존 `replanPolicy`·`allowedPaths`의 실제 제한 안에서 정한다. 같은 스택의 PR마다 사용자 리뷰나 재승인을 기다리지 않는다. 합의 범위·한도 안의 실패와 보완은 메인이 처리하되, 새 목표·권한·검증 기준 완화·해결할 수 없는 인증/환경 문제와 사용자 중단은 우회하지 않는다. PR 종료 계획은 실제 전달 확인 뒤 PR 링크·검토 순서·주요 변경·검증 결과·제외/후속 범위로 인계하며, 로컬 구현이나 테스트 통과만으로 끝내지 않는다.
+
+- 메인이 `workflow_start({ goal: "목표" })`로 읽기 전용 조사와 인터뷰를 시작한다. 사용자가 `/workflow start <목표>`로 직접 시작할 수도 있다. 두 진입점은 같은 진행 안내를 받는다. 도구 응답의 `guidance`는 일회성 안내이며 정본에 저장하거나 별도 모델 턴을 만들지 않는다.
 - `workflow_propose`의 실제 UI에서 `승인`을 선택하거나 `/workflow approve`로 승인한다. 모델의 텍스트·도구 인자는 승인이 아니다. `endpoint: "pr"`일 때만 선택 필드 `prBase`를 지정할 수 있으며 생략하면 `stage`다. stacked PR이면 보호 브랜치(`main`, `master`, `stage`, `development`, `production`)가 아닌 기존 원격 브랜치를 지정한다. 승인 화면에 base가 표시된다.
-- `/workflow start --auto <목표>`로 시작하면 제안된 계획(재제안 포함)을 사용자 확인 없이 `via: "auto"`로 승인하고 계획의 종료 지점까지 이어간다. clean 작업 트리·보호 브랜치 같은 승인 조건은 그대로 검사하며, 통과하지 못하면 승인 대기로 남아 `/workflow approve`가 필요하다. 플래그는 사용자 명령에서만 켤 수 있다.
+- `/workflow start --auto <목표>`로 시작하면 제안된 계획(재제안 포함)을 사용자 확인 없이 `via: "auto"`로 승인하고 계획의 종료 지점까지 이어간다. 미결정 정책을 임의로 정하는 옵션은 아니며 필요한 인터뷰는 유지한다. 명시적 변경 인수가 없는 전달 계획의 clean 조건·보호 브랜치 제한 등은 그대로 검사한다. 제안 사전 검사가 실패하면 기존 계획과 증거를 보존하고 차단 이유를 알리며, 승인 직전 상태가 달라져도 승인을 거절한다. 플래그는 사용자 명령에서만 켤 수 있다.
 - `workflow_dispatch` → `workflow_check` → 독립 review 순서로 진행한다. 구현 완료 주장은 검사 증거가 아니다.
 - 모델은 agent 설정을 따르고, effort는 메인이 dispatch마다 `thinking`(`low`·`medium`·`high`·`xhigh`)으로 정할 수 있다. 생략하면 agent 기본값이며 선택한 값은 attempt에 기록된다. subagent 관리 API의 `thinking` 기능이 없으면 시작하지 않는다.
 - `/workflow status|pause|resume|cancel`로 제어한다. 검사 중단은 독립 프로세스 그룹 전체에 SIGTERM을 보내고 기본 2초 뒤 SIGKILL로 강제 종료한다. 그룹 소멸과 child의 close 확인 전에는 stopping을 유지해 재개·dispatch를 거절한다. 검사 타임아웃(기본 10분)도 같은 절차로 일시정지한다. 취소는 파일 rollback이 아니며 세션 재시작은 자동 재개하지 않는다.
@@ -30,6 +36,31 @@ bunx --no-install biome check --error-on-warnings workflow-controller
 
 테스트는 실제 임시 Git 저장소·로컬 bare remote·실제 Pi 이벤트 버스와 subagent 관리 계약의 fake 응답자, PATH의 fake gh 실행 파일을 사용한다. 실제 subagent 구현·GitHub·사용자 설정을 변경하지 않는다.
 
+## 사전 검사와 기존 미커밋 변경 인수
+
+메인은 workflow 전환을 권하거나 기존 작업을 취소하기 전에 `workflow_preflight({ spec })`로 후보 계획이 승인 가능한지 확인한다. `spec`을 생략하면 현재 저장소·브랜치·HEAD·변경 파일과 차단 요인을 조회한다. 시작 전이나 진행 중에도 사용할 수 있으며, 계획·승인·검증 증거·파일·실제 Git index를 바꾸지 않는다. 조회 결과는 승인이나 재개 권한이 아니다.
+
+새 작업에서 기존 산출물을 이어받으려면 일반 `commit`·`pr` 계획에 `adoptChanges`를 명시한다. 단순히 dirty 상태를 허용하는 옵션이 아니라, 인수할 변경과 이후 보완 범위를 승인하는 계약이다.
+
+```json
+{
+  "endpoint": "pr",
+  "prBase": "stage",
+  "adoptChanges": {
+    "paths": ["src/settings/panel.tsx", "src/settings/panel.test.tsx"],
+    "allowedPaths": ["src/settings/"]
+  }
+}
+```
+
+예제는 전체 계획 중 인수 설정 부분이다. `paths`에는 현재 변경된 파일을 빠짐없이 적는다. 삭제나 rename도 원본·대상 경로를 포함한다. 무관한 기존 변경이 함께 있으면 부분 인수하지 않고 거절한다. `allowedPaths`는 승인 뒤 보완할 정확한 파일 또는 `/`로 끝나는 디렉터리 범위이며, 생략하면 `paths`만 허용한다. 절대 경로·상위 경로 이동·와일드카드는 허용하지 않는다.
+
+확장은 파일 목록·변경 요약·지문을 직접 계산하고 저장소·브랜치·기준 HEAD·허용 범위·전달 대상을 승인 화면에 표시한다. 표시한 뒤 HEAD·파일·index·전달 대상이 달라지면 승인을 거절한다. 충돌이나 종료되지 않은 관리 실행이 있어도 인수하지 않는다. 실패한 후보가 기존 승인과 검사 증거를 먼저 지우지 않으며, 이전 workflow의 승인이나 blocked 판정을 새 계획의 pass로 복사하지 않는다.
+
+승인 후 허용 범위 안의 보완은 재승인 없이 진행하지만, 내용이 바뀌면 검사·검수 증거를 새로 받아야 한다. 범위 밖 변경은 검사·검수·전달에서 거절한다. 전달 worker는 최종 검수된 트리만 커밋하고 확장이 실제 커밋·원격·PR을 확인한다. 이 기능을 사용하려고 임시 커밋·stash를 만들거나 기존 파일을 지울 필요는 없다.
+
+`adoptChanges`가 없으면 일반 전달 계획의 clean 조건을 유지한다. 이미 만들어진 커밋을 그대로 보내는 `deliveryMode: "existing-commit"`과는 함께 사용하지 않는다.
+
 ## 이미 만들어진 커밋의 전달
 
 이전 작업에서 커밋을 만들었고 push·PR만 남았다면, 일반 `workflow_propose` 계획에 아래 설정을 포함한다. `title`, `objective`, 검사·성공 기준 등 나머지 계획 필드도 필요하다.
@@ -54,6 +85,7 @@ bunx --no-install biome check --error-on-warnings workflow-controller
 
 | 도구 | 동작 |
 | --- | --- |
+| `workflow_preflight({ spec? })` | 현재 작업 공간이나 후보 계획의 차단 요인을 상태 변경 없이 확인한다. |
 | `workflow_start({ goal, mode? })` | 새 계획을 시작한다. `mode`는 `single`(기본) 또는 `stack`이다. |
 | `workflow_status({})` | 시작 전이나 완료 뒤에도 상태를 확인한다. |
 | `workflow_pause({ reason })` | 관리 실행의 중단을 요청하고 일시정지한다. |
@@ -72,7 +104,7 @@ bunx --no-install biome check --error-on-warnings workflow-controller
 
 - `/workflow start --stack <목표>`는 읽기 전용 조사 후 `workflow_stack_propose`로 전체 계획을 제안하고 승인받는다.
 - `/workflow start --stack --auto <목표>`는 같은 계획을 사용자 확인 없이 승인한다. `--auto --stack` 순서도 허용한다. `--stack` 또는 도구의 `mode: "stack"`은 PR 구성 방식이고, `--auto`는 사용자 명령에서만 켤 수 있는 계획 승인 방식이다.
-- 승인 범위는 계획한 브랜치 생성·전환과 PR별 commit·push·Draft PR 전달을 포함한다. 같은 계획의 다음 PR마다 승인을 다시 요구하지 않는다. 실행 시작 후 계획 변경은 거절하며 `--auto`가 범위 확장이나 이력 재작성 권한을 주지는 않는다.
+- 승인 범위는 계획한 브랜치 생성·전환과 PR별 commit·push·Draft PR 전달을 포함한다. 같은 계획의 다음 PR마다 승인을 다시 요구하지 않는다. 실행 시작 후에는 `workflow_stack_replan`으로 미전달 구간의 변경을 제안한다. `--auto`가 범위 확장이나 이력 재작성 권한을 주지는 않는다.
 - `rootBase`는 `stage` 또는 승인된 비보호 원격 feature 브랜치다. 승인 시 원격 SHA를 고정하며 해당 커밋 객체가 로컬에 없으면 멈춘다. 자동 fetch는 하지 않는다. 대상 브랜치는 보호 브랜치가 아니어야 하며 계획 시 로컬이나 원격에 이미 존재하면 거절한다.
 
 `workflow_stack_propose` 계획 예제는 다음과 같다. 검사 명령과 필수 검수·CI 이름은 대상 프로젝트에 맞춰 지정한다. unit의 `id`와 `branch`는 각각 고유해야 하며, PR별 `checks`·`requiredReviews`와 전체 `integrationChecks`·`integrationReviews`는 비워둘 수 없다.
@@ -84,12 +116,14 @@ bunx --no-install biome check --error-on-warnings workflow-controller
   "nonGoals": ["merge와 배포"],
   "successCriteria": ["설정 기반과 UI의 통합 검사 및 필수 검수가 통과한다"],
   "rootBase": "stage",
+  "replanPolicy": { "maxReplans": 2 },
   "units": [
     {
       "id": "foundation",
       "title": "설정 기반",
       "objective": "UI가 사용할 설정 기반을 추가한다",
       "branch": "feature/settings-foundation",
+      "allowedPaths": ["src/settings/"],
       "checks": ["bun run test", "bun run typecheck"],
       "requiredReviews": ["code"],
       "ciChecks": []
@@ -99,6 +133,7 @@ bunx --no-install biome check --error-on-warnings workflow-controller
       "title": "설정 UI",
       "objective": "설정 기반을 사용하는 UI를 추가한다",
       "branch": "feature/settings-ui",
+      "allowedPaths": ["src/settings/"],
       "checks": ["bun run test", "bun run typecheck"],
       "requiredReviews": ["code", "figma"],
       "ciChecks": []
@@ -112,6 +147,26 @@ bunx --no-install biome check --error-on-warnings workflow-controller
 ```
 
 예제의 첫 PR은 `stage`, 두 번째 PR은 `feature/settings-foundation`을 base로 한다. `ciChecks: []`는 해당 PR의 원격 CI를 검사하지 않는다는 뜻이다. 프로젝트 필수 CI가 있으면 실제 check-run 이름을 계획에 명시해야 하며 빈 배열로 생략하지 않는다.
+
+`replanPolicy`는 처음 승인할 때 범위 안의 재계획을 메인에 위임하는 선택 항목이다. `maxReplans`는 1~5이며, 자동 재계획의 횟수 한도도 승인 대상이다. unit의 `allowedPaths`에는 보완할 파일·디렉터리 범위를 적는다. 메인이 나중에 정책 필드를 추가한다고 위임 권한이 생기지는 않는다.
+
+### 진행 중인 스택 재계획
+
+메인은 실행 중인 worker·검사가 실제로 종료된 뒤 `workflow_stack_replan({ plan, reason, adoptChanges?, excludedRequirements? })`으로 현재 미전달 PR부터 뒤쪽 계획을 바꿀 수 있다. 이미 전달한 PR의 계획·커밋·부모·증거는 그대로 유지한다. 기존 스택을 취소하거나 새 workflow를 만들 필요가 없다.
+
+처음 위임한 횟수 안에서 다음 조건을 모두 만족하면 승인창 없이 적용한다.
+
+- 전체 목표·제외 범위·성공 기준·통합 검사·검수·한도·루트 부모를 유지한다.
+- 미전달 PR의 id·브랜치·순서를 유지하고 검사·필수 검수·CI를 줄이지 않는다.
+- 파일 허용 범위를 넓히거나 요구사항을 제외하지 않는다.
+
+이 범위에서는 단위별 작업 설명을 보완하거나 검사를 추가할 수 있다. 위임이 없거나 목표·권한·검증 기준이 달라지면 변경 전후와 영향을 보여주고 사용자 승인을 받는다. `--auto`도 이 구분을 우회하지 않는다. 보류나 사전 검사 실패, 승인 중 작업 공간 변경이 발생하면 기존 계획·승인·증거를 남긴다.
+
+작성 중인 파일은 `adoptChanges`로 명시적으로 인수한다. 자동 인수는 기존 unit의 `allowedPaths` 안에서만 가능하다. 새 unit의 허용 범위를 좁혔다면 인수 파일과 보완 범위도 그 안에 있어야 하며, 실행·전달에서는 인수 범위와 단위 범위를 모두 검사한다. 허용 범위를 정하지 않았거나 넓혀야 한다면 사용자 확인이 필요하다. 충돌·미종료 worker·변경된 원격 부모·사용자 중단을 인수나 재계획으로 우회하지 않는다. 이미 준비한 현재 브랜치는 관리 실행 기록과 부모 SHA를 확인해 이어 쓰며, 임시 커밋·stash·reset·rebase로 맞추지 않는다.
+
+이전 계획과 현재 단위의 실행은 `stack.revisions`에 남긴다. 영향받은 검사·검수는 다시 수행하지만 과거 구현자의 검수 금지, 복구 의무, 개선 한도는 초기화하지 않는다. 사용자 승인으로 제외한 요구사항은 `excludedRequirements`에 남기고 완료와 구분한다. 최종 보고에는 전체 성공 기준의 충족 여부, PR 검토 순서, 검사·검수 결과, 제외·미완료 사항을 함께 제시한다.
+
+### 실행과 완료 확인
 
 실행 순서는 PR별 `prepare → implement → check → requiredReviews별 review → deliver`, 모든 PR 전달 후 `integration check → integrationReviews별 review → 최종 PR·CI 확인`이다.
 

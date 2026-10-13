@@ -1,9 +1,10 @@
 import { Value } from "typebox/value";
 import { mustRun, run, snapshot } from "./io.ts";
-import { evidenceValid, protectedBranch, type Workflow } from "./model.ts";
+import { evidenceValid, guard, protectedBranch, type Workflow } from "./model.ts";
+import { assertRemoteTarget, validatePaths } from "./preflight.ts";
 import { stackPlanSchema, type StackPlan, type StackState, type UnitExecution } from "./stack-model.ts";
 
-export async function validateStackPlan(repo: string, plan: StackPlan): Promise<void> {
+export async function validateStackPlan(repo: string, plan: StackPlan, existingBranches: string[] = []): Promise<void> {
 	if (!Value.Check(stackPlanSchema, plan)) throw new Error("스택 계획의 필수 항목이 잘못되었습니다.");
 	if (
 		new Set(plan.units.map((unit) => unit.id)).size !== plan.units.length ||
@@ -12,11 +13,19 @@ export async function validateStackPlan(repo: string, plan: StackPlan): Promise<
 		throw new Error("스택 PR의 id와 브랜치는 각각 유일해야 합니다.");
 	if (plan.rootBase !== "stage" && protectedBranch(plan.rootBase))
 		throw new Error("스택의 기준 브랜치는 stage 또는 비보호 브랜치여야 합니다.");
+	if (
+		[...plan.integrationChecks, ...plan.units.flatMap((unit) => unit.checks)].some((command) =>
+			guard("bash", { command }),
+		)
+	)
+		throw new Error("검사 명령에서 전달·merge·workflow 실행은 금지입니다.");
 	await checkBranch(repo, plan.rootBase);
 	for (const unit of plan.units) {
+		if (unit.allowedPaths) validatePaths(unit.allowedPaths);
 		if (protectedBranch(unit.branch) || unit.branch === plan.rootBase)
 			throw new Error("스택 대상 브랜치는 보호 브랜치나 기준 브랜치일 수 없습니다.");
 		await checkBranch(repo, unit.branch);
+		if (existingBranches.includes(unit.branch)) continue;
 		const local = await run(repo, "git", ["show-ref", "--verify", "--quiet", `refs/heads/${unit.branch}`]);
 		if (local.code === 0) throw new Error(`이미 존재하는 로컬 브랜치: ${unit.branch}`);
 		if (local.code !== 1) throw new Error(`로컬 브랜치 확인 실패: ${local.stderr}`);
@@ -64,6 +73,7 @@ export async function inspectPreparation(state: Workflow): Promise<void> {
 
 export async function verifyStackDependencies(state: Workflow): Promise<void> {
 	const { stack, approval } = approvedStack(state);
+	await assertRemoteTarget(state.repoRoot, approval.target);
 	const root = await remoteHead(state.repoRoot, stack.plan.rootBase);
 	if (root !== approval.rootHead) invalidate(stack, 0, "원격 기준 커밋이 승인 이후 바뀌었습니다.");
 	for (const [index, result] of stack.results.entries()) {
@@ -200,7 +210,7 @@ async function checkBranch(repo: string, branch: string): Promise<void> {
 	if (result.code !== 0 || result.stdout.trim() !== branch) throw new Error(`잘못된 브랜치 이름: ${branch}`);
 }
 
-async function remoteHead(repo: string, branch: string): Promise<string | undefined> {
+export async function remoteHead(repo: string, branch: string): Promise<string | undefined> {
 	const ref = `refs/heads/${branch}`;
 	const output = await mustRun(repo, "git", ["ls-remote", "origin", ref]);
 	if (!output) return undefined;
