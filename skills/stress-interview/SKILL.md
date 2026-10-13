@@ -8,7 +8,7 @@ disable-model-invocation: true
 
 사용자가 이 절차를 명시 요청했거나 명시 선택한 상위 워크플로의 하위 단계일 때만 수행한다. 일반 리뷰 요청이나 다른 검증의 완료만으로 자동 진입하지 않는다.
 
-`$ARGUMENTS`에 대해 **`verifier` + `reviewer` + `challenger`를 병렬 호출**해 교차 검토한다.
+`$ARGUMENTS`에 대해 **`verifier` + `reviewer` + `challenger`를 병렬 호출**해 교차 검토한다. 검토 결과와 증거를 반환하는 스킬이며 단독 호출은 검토에서 종료한다. 수정·반복·전달은 별도 요청 또는 선택된 상위 흐름이 맡는다.
 
 ## 목적
 - 구현/수정 사항을 배포 전 관점에서 압박 검토한다.
@@ -17,7 +17,7 @@ disable-model-invocation: true
 
 ## 실행 규칙
 1. 먼저 **intent를 한 문단으로 선언**한다: 이 변경이 달성하려는 것이 무엇인가. 사용자 요청, 커밋 메시지, PR 설명, 코드 자체에서 도출하고, 불확실하면 진행 전에 사용자에게 확인한다. 이 intent 문단을 세 에이전트 프롬프트에 모두 포함한다. **리뷰어는 intent 달성 여부를 공격하지, intent 자체의 옳고 그름을 공격하지 않는다.**
-2. `subagent`는 셸 바이너리가 아니라 **Pi 도구**다. `bash`에서 `subagent ...`를 실행하지 말고, 반드시 `functions.subagent` 도구를 `{ "command": "subagent ..." }` 형태로 호출한다.
+2. 호출과 분담은 메인 또는 선택된 상위 흐름이 맡고 worker는 재귀 호출하지 않는다. 관리 모드에서는 `workflow_check` 뒤 계획의 서로 다른 필수 검수 키로 세 관점을 `workflow_dispatch`의 `role: "review"`·`reviewKey`·`contextMode: "isolated"`로 실행한다. verifier의 실제 검사 증거도 유지한다. 관리 모드 밖에서는 Pi `subagent` 도구를 사용하며 `bash`/셸 바이너리로 실행하지 않는다.
 3. `subagent help`가 아직 확인되지 않았거나 현재 세션에서 인터페이스가 불명확하면 먼저 Pi 도구로 확인한다.
    - 예: `subagent({ command: "subagent help" })`
 4. 아래 3개를 **병렬**로 실행한다.
@@ -33,18 +33,20 @@ disable-model-invocation: true
 
 ## subagent Pi 도구 호출 방식
 
+아래 호출 방식과 예시는 관리 모드 밖에서 메인이 실행할 때만 적용한다. 관리 모드에서는 실행 규칙 2의 dispatch 계약을 따른다.
+
 - 항상 Pi의 `subagent` 도구를 사용한다. 터미널 명령어가 아니므로 `bash`/셸에서 실행하지 않는다.
 - 도구 인자는 단일 객체이며 키는 `command` 하나다.
 - `run`/`continue`에는 task separator `--`가 필수다.
 - 병렬 검토는 `batch`를 기본으로 사용한다.
 - 실행 직후 `status`/`detail`을 반복 polling하지 않는다. 완료/실패 follow-up을 기다린다.
-- 현재 main context를 공유해야 하면 `--main`, 격리된 검토가 필요하면 `--isolated`를 명시한다.
+- 세 검토 모두 `--isolated`를 사용한다. 검토할 revision·현재 diff·실행 증거를 프롬프트에 명시해 같은 대상 상태를 검토하도록 한다.
 
 예시:
 
 ```text
 subagent({ command: "subagent help" })
-subagent({ command: "subagent batch --main --agent verifier --task \"Intent: <intent 문단>. $ARGUMENTS 를 검증해줘. 가능하면 테스트/타입체크/빌드/재현 가능한 증거를 수집해줘.\" --agent reviewer --task \"Intent: <intent 문단>. $ARGUMENTS 를 코드 리뷰해줘. correctness, regression, maintainability 위주로, intent 달성 여부를 기준으로 봐줘.\" --agent challenger --task \"Intent: <intent 문단>. $ARGUMENTS 에 대해 숨은 가정, 실패 시나리오, 취약한 결정 포인트를 최대 3개 질문으로 압박 검토해줘.\"" })
+subagent({ command: "subagent batch --isolated --agent verifier --task \"Intent: <intent 문단>. $ARGUMENTS 를 검증해줘. 가능하면 테스트/타입체크/빌드/재현 가능한 증거를 수집해줘.\" --agent reviewer --task \"Intent: <intent 문단>. $ARGUMENTS 를 코드 리뷰해줘. correctness, regression, maintainability 위주로, intent 달성 여부를 기준으로 봐줘.\" --agent challenger --task \"Intent: <intent 문단>. $ARGUMENTS 에 대해 숨은 가정, 실패 시나리오, 취약한 결정 포인트를 최대 3개 질문으로 압박 검토해줘.\"" })
 ```
 
 ## 권장 호출 프롬프트
@@ -117,10 +119,10 @@ Verifier 🟡 PARTIAL · Reviewer ❌ incorrect · Challenger 🟡 Pivot
 ```mermaid
 flowchart TD
     A[변경사항] --> P1{"Pass 1<br/>Spec Compliance"}
-    P1 -->|"누락 Under-built"| FIX1[수정] --> P1
+    P1 -->|"누락 Under-built"| FIX1[지적 반환]
     P1 -->|"초과 Over-built · YAGNI"| FIX1
     P1 -->|"명세 일치"| P2{"Pass 2<br/>Code Quality"}
-    P2 -->|"Critical / Important"| FIX2[수정] --> P2
+    P2 -->|"Critical / Important"| FIX2[지적 반환]
     P2 -->|"Minor만 남음"| DONE["🟢 Ready<br/>Minor는 기록만"]
 ```
 
@@ -133,7 +135,7 @@ flowchart TD
 판정:
 - **누락(Under-built)**: 명세에 있는데 구현에 없는 것
 - **초과(Over-built)**: 명세에 없는데 구현에 있는 것 → YAGNI 위반
-- 누락/초과가 있으면 수정 후 Pass 1 재실행
+- 누락/초과가 있으면 지적을 반환하고 Pass 2는 시작하지 않는다. 상위 흐름에서 수정을 선택했다면 수정 후 Pass 1을 다시 확인한다.
 
 ### Pass 2: Code Quality (코드 품질)
 **Pass 1 통과 후에만** 진행한다.
@@ -142,7 +144,7 @@ flowchart TD
 2. `challenger`에게: 숨은 가정, 실패 시나리오 압박 검토 요청
 
 판정:
-- Critical/Important 이슈 → 수정 후 Pass 2 재실행
+- Critical/Important 이슈 → 지적 반환. 상위 흐름에서 수정을 선택했다면 수정 후 Pass 2를 다시 확인한다.
 - Minor 이슈 → 기록만 하고 통과
 
 **주의: Pass 1 전에 Pass 2를 시작하지 않는다.** 명세 미충족 상태에서 코드 품질을 논하는 것은 무의미하다.

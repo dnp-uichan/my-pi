@@ -10,8 +10,8 @@ disable-model-invocation: true
 
 `$ARGUMENTS`에 대해 아래 루프를 수행한다:
 
-- **Cycle 1**: `stress-interview` 실행 → `worker` 수정
-- **Cycle 2**: 다시 `stress-interview` 실행 → `worker` 수정
+- **Cycle 1**: `stress-interview` 기준의 verifier·reviewer·challenger 교차 검토 → `worker` 수정·관련 검증
+- **Cycle 2**: 같은 기준의 교차 검토 → `worker` 수정·관련 검증
 
 총 **2 사이클**만 수행한다. 무한 반복하지 않는다.
 
@@ -22,18 +22,20 @@ disable-model-invocation: true
 
 ## 실행 순서
 1. 대상 범위를 1~2문장으로 고정한다.
-2. `subagent` 호출이 필요하면 셸 바이너리가 아니라 **Pi 도구**로 호출한다. `bash`에서 `subagent ...`를 실행하지 말고, 반드시 `functions.subagent` 도구를 `{ "command": "subagent ..." }` 형태로 사용한다.
+2. 분담은 메인 또는 선택된 상위 흐름이 맡는다. worker는 하위 worker나 리뷰어를 재귀 호출하지 않는다. 관리 모드 밖에서는 현재 인터페이스를 확인한 Pi `subagent` 도구를 사용하며 셸 바이너리로 실행하지 않는다. 관리 모드에서는 `workflow_check` 뒤 계획의 필수 관점별로 `workflow_dispatch`의 `role: "review"`·`reviewKey`를 사용하고 수정은 `role: "implement"`로 맡긴다. 선택한 3관점 검토와 2사이클 한도를 줄이지 않는다.
 3. **Cycle 1**
-   - `/skill:stress-interview $ARGUMENTS`
+   - 대상 범위에 대해 verifier·reviewer·challenger를 병렬 실행해 실행 증거·회귀·가정을 교차 검토한다. `stress-interview`의 검토 기준을 사용하되 별도 옵션이나 전체 수정 체인을 자동 추가하지 않는다.
    - 결과에서 수정이 필요한 actionable item만 추린다.
    - `worker`에게 **해당 actionable item만** 수정하도록 요청한다.
 4. **Cycle 2**
-   - 다시 `/skill:stress-interview $ARGUMENTS`
+   - 수정된 상태에서 같은 세 관점을 다시 교차 검토한다.
    - 남은 actionable item만 추린다.
    - `worker`에게 다시 수정 요청한다.
-5. 2사이클 후 종료하고, 남은 리스크와 미해결 항목을 명시한다.
+5. 수정 후 영향받은 검사와 지적 해결을 독립적으로 확인한다. 2사이클 후 종료하고, 남은 리스크와 미해결 항목을 명시한다. 마지막 수정 자체를 확인하지 못했으면 완료로 보고하지 않는다. 추가 전체 검수 사이클·simplify·commit·PR은 자동 연결하지 않는다.
 
 ## subagent Pi 도구 호출 방식
+
+아래 예시는 관리 모드 밖에서 메인이 분담할 때만 사용한다. 관리 모드의 검사·필수 검수 gate를 2사이클 한도로 대체하지 않으며, gate가 남으면 차단 상태로 반환한다.
 
 - `subagent`는 Pi harness가 제공하는 도구이며 로컬 터미널 바이너리가 아니다.
 - 호출 인자는 단일 객체이고 키는 `command`다.

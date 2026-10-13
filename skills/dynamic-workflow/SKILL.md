@@ -50,7 +50,7 @@ Pi 명령은 `/skill:dynamic-workflow [hard] <작업 내용>`이다. 인자는 �
 
 ### 1. Scope lock
 
-목표·범위·성공 기준·종료 지점을 먼저 밝힌다. 아래 항목 중 필요한 내용을 짧게 정리하며 고정 양식이나 파일 저장은 요구하지 않는다. 중요한 결정이 모호하면 `ask_user_question`으로 확인한다.
+관련 코드·문서·조회 도구로 사실과 기존 패턴을 먼저 확인하고 목표·범위·성공 기준·종료 지점을 밝힌다. 인터뷰 깊이는 남은 불확실성과 실패 영향에 맞춘다. 아래 항목 중 필요한 내용만 정리하고, 결과를 바꾸는 미결정 정책·범위·성공 기준·허용 대안·실패 대응·전달 권한을 묶어서 확인한다. 이미 합의한 내용과 일상적인 기술 선택을 재질문하지 않으며 고정 질문 수·별도 인터뷰 문서·반복 승인 폼은 요구하지 않는다.
 
 ```markdown
 ## Workflow Scope
@@ -59,7 +59,8 @@ Pi 명령은 `/skill:dynamic-workflow [hard] <작업 내용>`이다. 인자는 �
 - Source of truth:
 - Success criteria: 반증 가능한 술어로 (무엇을 실행·확인하면 done인지)
 - Constraints: 시간/토큰/권한/외부 전송
-- Endpoint: 검증까지·커밋까지·PR까지 등 요청 범위
+- Endpoint: 단독 조사·설명·검수 등 요청 범위, 개발 흐름이면 검증까지·커밋까지·PR까지
+- Delivery authority: 저장소·head/base·commit·push·Draft PR 권한
 - Stop condition:
 ```
 
@@ -67,7 +68,7 @@ Success criteria를 체크 가능한 술어로 쓸 수 없으면 장기 실행�
 
 메인이 관련 코드와 적용되는 프로젝트 규칙을 읽고 요구사항·변경 계획·검증 방법을 정리한다. 이미 합의된 계획은 재사용한다. 범위와 실행이 승인돼 있으면 단계 전환마다 승인을 반복하지 않는다.
 
-개발 변경이면 전역 지침의 기본 개발 흐름과 아래 연결 규칙을 따른다. 해당 시점의 단계 스킬만 읽고, 각 스킬이 전체 흐름을 다시 시작하지 않게 한다. `disable-model-invocation: true`인 스킬도 사용자가 승인한 기본 개발 흐름의 해당 단계로 사용할 수 있다. 조사·설명 또는 단계 단독 요청에는 이 연결을 강제하지 않는다. PRD·gap-check·test-triage·self-healing·simplify는 별도 선택 없이 추가하지 않는다.
+개발 변경이면 전역 지침의 기본 개발 흐름과 아래 연결 규칙을 따른다. 해당 시점의 단계 스킬만 읽고, 각 스킬이 전체 흐름을 다시 시작하지 않게 한다. `disable-model-invocation: true`인 스킬도 사용자가 승인한 기본 개발 흐름의 해당 단계로 사용할 수 있다. 조사·설명 또는 단계 단독 요청에는 이 연결을 강제하지 않는다. PRD·gap-check·test-triage·self-healing·simplify·stress-interview·large-feature-loop는 별도 선택 없이 추가하지 않는다. 선택한 hard나 복수 독립 검수의 고유 기준은 기본 흐름으로 줄이지 않는다. 서로 독립적인 요청과 하나의 결과물을 이루는 의존 PR들을 구분하고, 스택이면 PR별 결과·diff 경계·부모 관계·검토 순서·통합 완료 기준을 처음에 합의한다.
 
 ### 2. Pattern 선택
 
@@ -108,14 +109,15 @@ Success criteria를 체크 가능한 술어로 쓸 수 없으면 장기 실행�
 - 한 번에 정확히 하나의 `todo_write` 항목만 `in_progress`로 둔다.
 - 독립 fan-out 결과는 반드시 synthesis barrier에서 합친다.
 - 개발 변경의 검수는 구현자와 다른 컨텍스트의 `reviewer` 1개를 기본으로 한다. 같은 최신 상태에 대한 독립 검수 결과는 재사용하고, 위험에 따라 필요한 관점을 추가한다. `verifier` 실행 자체가 요구사항·AGENTS 준수 검수를 대신하지는 않는다.
-- 위임 프롬프트에 작업 범위, 적용 지침과 선택된 추가 제약, 테스트 잠금, 종료 지점과 금지 권한을 전달한다. worker가 임의로 단계 생략·테스트 완화·commit·push·PR을 하지 않도록 실행 권한을 구분한다.
+- 위임 프롬프트에 작업 범위, 적용 지침과 선택된 추가 제약, 테스트 잠금, 종료 지점과 금지 권한을 전달한다. worker가 임의로 단계 생략·테스트 완화·commit·push·PR을 하지 않도록 실행 권한을 구분한다. worker는 하위 worker·reviewer를 재귀 호출하지 않고 결과나 추가 분담 필요를 메인에 반환한다. 분담과 단계 연결은 메인이 맡는다.
+- 승인된 개발/테스트 변경 범위의 최소 테스트 변경은 메인이 `test-write`의 '확정 후 테스트 잠금' 기준으로 필요성·독립 근거·영향을 확인해 보수적으로 결정한다. worker·reviewer·lint·simplifier는 제안과 근거를 반환하며, 메인이 승인한 구체적 변경 범위만 수정 역할에 위임한다. 단독 읽기 전용 요청의 범위와 사용자 명시 제한은 유지한다.
 - 같은 파일을 고치는 worker를 병렬 실행하지 않는다.
 - 긴 프롬프트/컨텍스트는 임시 markdown 파일로 쓰고 subagent에게 경로를 전달한다.
-- 장기 실행·다수 사이클·사용자가 자리를 비우는 워크플로우는 `show-me-your-work` 스킬의 `decisions.tsv` 결정 로그를 유지하고, 최종 보고를 Attention 섹션으로 마무리한다.
+- 장기 인계·감사나 프로젝트 규칙상 결정 트레일이 필요한 경우에만 `show-me-your-work` 기준의 로그와 Attention 보고를 계획에 포함한다. 단순히 단계가 많다는 이유로 파일·별도 검수 체인을 추가하지 않는다.
 
 ### 4. Subagent 실행 지침
 
-먼저 현재 세션에서 `subagent help`를 확인하지 않았거나 인터페이스가 불명확하면 확인한다.
+아래는 메인이 관리 모드 밖에서 사용하는 지침이다. 관리 모드에서는 `workflow_dispatch`를 사용하며 worker에게 오케스트레이션을 다시 맡기지 않는다. 현재 세션에서 `subagent help`를 확인하지 않았거나 인터페이스가 불명확하면 확인한다.
 
 - 독립 작업: `subagent batch [--main|--isolated] --agent <agent> --task "..." ...`
 - 의존 작업: `subagent chain [--main|--isolated] --agent <agent> --task "..." --agent <agent> --task "..."`
@@ -132,7 +134,7 @@ Success criteria를 체크 가능한 술어로 쓸 수 없으면 장기 실행�
 - 실행 직후 바로 `status/detail`로 폴링하지 않는다. 자동 완료/실패 follow-up을 기다린다.
 - 읽기 전용 역할(challenger, reviewer, verifier)에는 파일 산출물을 요구하지 않는다. write/셸 도구가 없어 조용히 불이행될 수 있다. 결과는 응답 본문으로 받고, 보존이 필요하면 메인 에이전트가 파일로 저장한다.
 - `continue`는 최신 메인 컨텍스트를 자동 동기화하지 않으므로, 이어서 필요한 변경사항/결론을 프롬프트에 명시한다.
-- 외부 전송, 삭제, 배포, 대량 변경, 비용 큰 작업은 사용자 승인 gate를 둔다.
+- 외부 전송, 삭제, 배포, 대량 변경, 비용 큰 작업은 권한 범위를 확인한다. 이미 승인한 실행은 재승인하지 않으며 승인 밖 권한·파괴적 Git·merge·배포·외부 메시지는 일반 개발이나 PR 목표로 허용된 것으로 보지 않는다.
 
 #### Failed write-capable run recovery
 
@@ -160,12 +162,12 @@ Git workspace라면 `HEAD`, worker commit 유무, `git status --short`, staged/u
 
 각 작업 단위는 시작할 때 정한 성공 기준을 모두 충족해야 완료다. 증거 하나로 다른 필수 gate를 대체하지 않는다.
 
-- 개발 변경: 요구사항 충족, 관련 테스트·프로젝트 필수 검사, 독립 검수와 필요한 개선 확인.
+- 개발 변경: 요구사항 충족, 관련 테스트·프로젝트 필수 검사, 독립 검수와 필요한 개선 확인. 테스트 변경은 위 `test-write` 기준의 재실행과 변경 타당성·누락·동등 이상 검출력 보존을 기존 독립 검수에서 확인한다. 새 전체 리뷰 체인을 자동 추가하지 않는다. 계획에 선택한 모든 필수 검수 관점이 끝나야 전달하며 첫 PASS로 나머지를 대체하지 않는다.
 - UI·통합 변경: 영향을 받는 경계의 실제 동작 확인. 정적 분석만으로 대체하지 않는다.
 - 데이터·문서 작업: 원문 근거, 주장 확인, 필요한 샘플 검산이나 구조 검사. 적용할 이유가 없는 코드 테스트를 만들지 않는다.
 - 기록: 대상 상태/revision, 명령·검사 범위·실제 결과, 독립 검수 근거. 코드·설정·의존성·계약이 바뀌면 영향받은 증거를 갱신한다.
 
-P0/P1, 필수 gate 실패·실행 불가 또는 다른 blocker가 남으면 다음 단계로 넘어가지 않는다. 테스트 실패는 즉시 원인 추정과 다음 조치를 보고한다. 판단이 필요한 이슈는 사용자에게 확인한다.
+P0/P1, 필수 gate 실패·실행 불가 또는 다른 blocker가 남으면 다음 단계로 넘어가지 않는다. 테스트 실패는 즉시 원인 추정과 다음 조치를 보고한다. 합의한 범위·실패 대응·한도 안에서 보완·재검증하고, 합의 밖 결정·권한·검증 기준 변경이나 해결할 수 없는 인증/환경 문제만 사용자에게 확인한다.
 
 ### 7. Loop policy
 
@@ -192,7 +194,7 @@ P0/P1, 필수 gate 실패·실행 불가 또는 다른 blocker가 남으면 다�
 - Next step:
 ```
 
-코드 변경이 있었다면 파일 경로와 검증 명령을 명시한다. 실행하지 못한 검증은 이유와 사용자가 실행할 명령을 적는다.
+코드 변경이 있었다면 파일 경로와 검증 명령을 명시한다. 실행하지 못한 검증은 이유와 사용자가 실행할 명령을 적는다. PR 종료 계획은 실제 전달 확인 후 PR 링크·검토 순서·주요 변경·검증·제외/후속 범위를 반환하며, 로컬 구현이나 테스트 통과만으로 완료하지 않는다.
 
 ## 기본 개발 흐름 연결
 
@@ -207,14 +209,43 @@ P0/P1, 필수 gate 실패·실행 불가 또는 다른 blocker가 남으면 다�
 
 ## 관리 모드 (`/workflow`)
 
-사용자가 `/workflow start <목표>`로 시작한 작업에서는 `workflow-controller` 확장이 승인·진행 상태·검증 증거·중단·전달을 기록하고 다음 단계 조건을 판정한다. 계획과 분담은 계속 메인이 맡는다. 관리용 subagent API가 없으면 시작이 거절되며 지침만으로 대신 진행하지 않는다.
+`workflow-controller` 확장은 승인·검사·독립 검수·중단·전달 조건을 관리하고 메인은 조사·필요한 인터뷰·판단·분담을 맡는다. 현재 계약은 확장의 `README.md`와 실제 도구/schema에서 확인한다. subagent 관리 API v1과 `thinking` 지원이 없으면 시작이 거절되며 지침으로 대신 진행하지 않는다.
 
-- 읽기 전용 조사 뒤 `workflow_propose`로 목표·제외 범위·완료 조건·검사 명령·종료 지점·개선 한도를 제안한다. `endpoint: "pr"`일 때만 선택 필드 `prBase`로 stacked PR의 base를 지정할 수 있으며 기본은 `stage`다. stacked base는 보호 브랜치(`main`, `master`, `stage`, `development`, `production`)가 아닌 기존 원격 브랜치여야 하며 승인 화면에 표시된다. 승인은 사용자 선택이나 `/workflow approve`로만 성립한다.
-- 구현·검수·조사 worker는 `workflow_dispatch`로 실행한다. 모델은 agent 설정을 유지하고, effort는 작업 난이도로 판단해 `thinking`에 지정한다. 단순 수정은 `low`, 일반 구현은 `medium`·`high`, 설계가 얽히거나 검수가 까다로운 변경은 `xhigh`이며 생략하면 agent 기본값이다. 이 모드에서는 메인 세션의 관리되지 않는 `subagent` 실행과 직접 `git commit`·`git push`·`gh pr create` 같은 명령을 확장이 막는다. 가드는 OS 수준 격리가 아니다.
-- 구현 worker의 완료 보고는 완료가 아니다. `workflow_check`의 검사 통과와, 구현 agent와 다른 reviewer의 `WORKFLOW_VERDICT: pass`가 같은 작업 트리 지문에 묶여야 다음 단계로 간다.
-- 실패하거나 중단된 구현은 `workflow_recover`로 실제 작업 공간 상태를 기록한 뒤 다시 실행한다. 사용자 판단이 필요하면 `workflow_block`으로 멈추고 질문한다.
-- 검수 통과(`ready-to-deliver`) 뒤 `workflow_dispatch`에 `role: "deliver"`로 전달 worker(기본 agent `worker`, `--main`)를 실행한다. `thinking`은 메인이 정한다. worker는 commit 스킬을 읽고 커밋하며, 종료 지점이 `pr`이면 pr 스킬을 읽고 push와 Draft PR까지 전달한다. 확장은 실제 커밋·원격·PR 상태를 확인한 뒤에만 완료로 기록하며 확인 실패 시 `blocked`로 멈춘다. 커밋만 완료되고 PR이 실패하면 커밋 완료를 기록하고, 재개 뒤 deliver를 다시 실행할 때 이미 된 단계는 반복하지 않는다. 전달 worker는 파일 내용 수정·merge·배포·force push·amend·rebase·reset을 하지 않는다. 구현 worker의 commit·push·PR 금지는 유지한다.
-- `/workflow status|pause|resume|cancel`로 확인·중지·재개한다. Esc도 일시정지로 처리하며 재시작이나 취소 뒤 자동 재개하지 않는다.
+테스트 변경 판단 위임은 관리 스키마·안전 gate 변경 권한이 아니다. 검사 목록(`checks` 등)·`requiredReviews`·`allowedPaths`·사용자 hold/stop·locked revision·전달 worker의 파일 내용 수정 금지와 기존 커밋 모드의 수정 금지를 우회하지 않는다.
+
+### 시작·합의·승인
+
+- 메인은 `workflow_start({ goal, mode? })`로 시작한다. `mode`는 `single`(기본) 또는 `stack`이다. 사용자의 `/workflow start [--stack] [--auto] <목표>`도 지원한다. 도구 시작은 구현·전달 승인이나 auto 권한이 아니며 이전 작업의 권한을 상속하지 않는다.
+- 읽기 전용 조사 뒤 필요한 미결정 사항만 인터뷰한다. 목표·제외 범위·성공 기준·수정 범위·허용 대안·실패 대응·보완/복구 한도·전달 권한을 기존 계획 필드에 담고 요약을 본문으로 먼저 설명한다. 개발 흐름에서 사용자가 더 이른 종료를 명시하지 않았으면 `endpoint: "pr"`를 제안한다. 단독 조사·설명·검수 요청은 해당 범위에서 끝내며, PR 제안은 schema 기본값이나 자동 권한이 아니다.
+- 단일 계획은 `workflow_propose`, 스택 계획은 `workflow_stack_propose`의 실제 승인 UI 또는 `/workflow approve`로 한 번 승인받는다. 사용자가 명시적으로 `/workflow start --auto`로 시작한 경우에만 안전 조건을 통과한 제안이 자동 승인된다. `--auto`는 미결정 정책·범위 확장·사용자 중단을 우회하지 않으며 도구 인자로 켤 수 없다.
+- 단일 `endpoint: "pr"`의 `prBase`는 기본 `stage`, 승인된 stacked base는 보호 브랜치가 아닌 기존 원격 feature 브랜치다. `requiredReviews`에 선택한 모든 검수 키를 명시한다. 생략 시 `code` 하나이므로 성공 기준에 적은 복수 검수가 자동 등록된다고 가정하지 않는다.
+
+### 사전 확인·기존 산출물
+
+- 전환을 권하거나 기존 작업을 취소하기 전에 `workflow_preflight({ spec? })`로 현재 상태와 후보 **단일** 계획의 승인 가능성을 확인한다. 상태·파일·실제 index를 바꾸지 않으며 결과는 승인·재개 권한이 아니다. 이 조회가 스택 계획 전체의 적합성까지 보장하지 않는다.
+- 기존 미커밋 변경은 일반 `commit`·`pr` 계획의 `adoptChanges`로 명시 인수한다. `paths`는 rename 원본·대상을 포함한 현재 변경 전체, `allowedPaths`는 정확한 파일 또는 `/`로 끝나는 디렉터리 범위다. 무관한 변경과 부분 인수는 거절하며 승인 뒤 범위 안의 보완은 재승인하지 않되 검사·검수 증거를 갱신한다. 인수가 없으면 전달 계획의 clean 조건을 유지한다.
+- 이미 만들어진 커밋은 일반 `endpoint: "pr"`의 `deliveryMode: "existing-commit"`으로 승인 SHA를 그대로 전달한다. 새 커밋·파일 수정·구현 worker는 금지하며 현재 workflow의 검사·필수 검수는 유지한다. `adoptChanges`와 함께 쓰거나 `verify`·`commit`·최초 스택 옵션으로 확대하지 않는다. 기존 커밋을 전달하려고 빈 커밋·stash·이력 재작성을 만들지 않는다.
+
+### 실행·검수·전달
+
+- 구현·조사·검수는 메인이 `workflow_dispatch`로 실행한다. 모델은 사용자 지정값과 agent 설정을 유지한다. `thinking`은 난이도에 맞춰 `low`·`medium`·`high`·`xhigh` 중 선택하고 생략하면 agent 기본값이다. 메인의 관리되지 않는 `subagent` 실행과 직접 Git 전달은 확장이 막지만 OS 수준 격리는 아니다. worker는 하위 worker를 호출하지 않는다.
+- 구현 완료 보고는 완료가 아니다. `workflow_check`의 검사 통과 뒤 `role: "review"`로 구현 agent와 다른 검수 agent를 실행한다. 복수 필수 검수는 각 `reviewKey`를 지정한다. 현재 verification 세대·시작/종료 작업 트리 지문에 연결된 `WORKFLOW_VERDICT: pass`가 모든 필수 키에 있어야 통과한다. 판정 누락·실패·형식 오류와 오래된 결과는 통과가 아니다.
+- 실패·중단된 구현은 `workflow_recover`로 실제 HEAD·작업 공간 상태를 기록한 뒤 다시 실행한다. 승인 범위·한도 안의 실패·보완·재검증은 재승인하지 않는다. 사용자 판단이 필요한 합의 밖 변경·권한·검증 기준이나 해결할 수 없는 인증/환경 문제는 `workflow_block`으로 멈추고 묻는다.
+- `verify`는 필수 검수 통과로 종료한다. `commit`·`pr`은 `ready-to-deliver` 뒤 `role: "deliver"`의 전달 worker(기본 `worker`, `main` 컨텍스트)가 commit·pr 스킬을 직접 읽고 승인된 단계만 수행한다. 기존 커밋 모드는 pr만 수행한다. 이미 완료한 단계는 반복하지 않으며 worker 재귀 호출·파일 내용 수정·merge·배포·force push·amend·rebase·reset은 금지한다.
+- 확장은 승인 브랜치·검수된 최종 트리·커밋·깨끗한 작업 트리를 확인하고, `pr`이면 실제 원격 HEAD·열린 Draft PR의 head/base까지 확인해야 완료한다. 실패하면 `blocked`로 멈추며 부분 전달 기록을 보존한다. pr 스킬의 assignee·reviewer·본문 기준을 확장이 대신 검사한다고 주장하지 않는다.
+
+### 선형 Stacked PR
+
+- `mode: "stack"` 또는 사용자의 `--stack`으로 명시 선택한다. 단일 `prBase` 지정은 PR 하나의 base 선택이며 스택 전체 관리가 아니다. 분기·합류 PR 그래프와 독립 요청 FIFO는 지원하지 않는다.
+- `rootBase`·PR별 결과·브랜치·부모 관계·검토 순서·`checks`·`requiredReviews`·`ciChecks`, 전체 `integrationChecks`·`integrationReviews`를 처음에 합의한다. 필수 CI는 실제 이름으로 지정한다. 최초 스택은 clean 작업 트리와 아직 존재하지 않는 대상 브랜치가 필요하며 일반 인수 사전 검사 결과로 이 조건을 대체하지 않는다.
+- PR별 `prepare → implement → check → requiredReviews별 review → deliver`, 전체 전달 후 `integration check → integrationReviews별 review → 최종 PR·CI 확인` 순서다. 승인 root SHA 또는 직전 확인 HEAD에서 `role: "prepare"` worker만 브랜치를 생성·전환한다. 같은 작업 트리의 PR 작업은 순차 실행하고 같은 계획의 PR마다 사용자 리뷰·재승인을 기다리지 않는다.
+- 통합 검수 agent는 모든 하위 PR 구현 agent와 달라야 한다. 통합 단계는 검사·검수만 허용하며 모든 PR·원격 부모·Draft PR head/base·필수 CI·최상단 HEAD·clean 상태 확인까지 끝나야 전체 완료다. 실패한 PR을 건너뛰거나 통합 PASS만으로 완료하지 않는다.
+- 실행 중 미전달 구간의 조정은 `workflow_stack_replan`을 사용한다. 최초 `replanPolicy.maxReplans` 위임과 `allowedPaths` 안에서 목표·제외 범위·성공 기준·통합 검사·검수·한도·root·미전달 id/브랜치/순서를 유지하고 검증을 줄이지 않을 때만 승인 없이 적용한다. 그 밖은 실제 사용자 승인 대상이며 `--auto`로 우회하지 않는다. 재계획의 `adoptChanges`는 최초 스택 인수 옵션이 아니다. 이미 전달한 PR·부모·증거와 과거 구현자의 검수 금지·복구 의무·개선 한도를 보존한다. 부모 변경은 차단하며 자동 restack·rebase·force push하지 않는다.
+
+### 중단·재개
+
+- 메인은 `workflow_status`·`workflow_pause({ reason })`·`workflow_resume({})`·`workflow_cancel({ reason })`로 운영할 수 있다. 시스템/메인 중단만 실제 상태 확인 뒤 도구로 재개한다. 사용자의 pause·Esc·cancel·실행 중단과 `workflow_block` 판단 보류는 사용자만 해제하며 다른 시작·취소로 우회하지 않는다.
+- 세션 재시작은 자동 재개하지 않는다. 미종료 worker·검사·전달 확인이 있으면 다음 작업을 시작하지 않는다. 한도 초과·출처 불명 과거 중단은 사용자 판단 대상이며 취소는 파일 rollback이나 PR 삭제가 아니다.
 - 완료·정지 기준은 `references/omo-managed-contract.md`를 따른다. 이 발췌문은 SUL-1.0 대상이다.
 
 ## Safety

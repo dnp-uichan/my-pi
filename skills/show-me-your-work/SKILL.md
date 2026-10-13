@@ -49,7 +49,7 @@ bash <skill-dir>/scripts/log.sh <logfile> <phase> <decision> <why> <evidence> <r
 
 - 기본 위치: 작업 디렉터리의 `decisions.tsv`. 동시 다발 작업이면 `.audit/<task-slug>.tsv`.
 - **기본은 커밋하지 않는다.** 로컬 로그만으로도 실행이 정직해진다.
-- 커밋은 리뷰어가 트레일 없이는 결과를 신뢰할 수 없는 규모(대형 포팅, 수 주짜리 마이그레이션)일 때만 한다. 커밋된 TSV는 PR에서 표로 렌더링된다.
+- 리뷰어가 트레일 없이는 결과를 신뢰할 수 없는 규모(대형 포팅, 수 주짜리 마이그레이션)라면 로그의 커밋 포함을 검토한다. 실제 커밋은 승인된 전달 범위에 포함될 때만 전달 worker가 수행하며 이 스킬 자체는 commit·push·PR 권한을 만들지 않는다. 커밋된 TSV는 PR에서 표로 렌더링된다.
 
 ## 종료 전 감사
 
@@ -64,7 +64,9 @@ bash <skill-dir>/scripts/log.sh <logfile> <phase> <decision> <why> <evidence> <r
 
 ## 교차 리뷰와 Attention 섹션
 
-핸드백 전에 작업을 수행하지 않은 별도 에이전트에게 트레일 검토를 맡긴다. 자기 검토는 대체재가 아니다.
+핸드백 전에 작업을 수행하지 않은 별도 에이전트에게 트레일 검토를 맡긴다. 자기 검토는 대체재가 아니다. 메인 또는 선택된 상위 흐름이 분담하며 worker는 검토 요청과 로그 경로를 메인에 반환하고 재귀 위임하지 않는다. 관리 모드에서는 필요한 트레일 검수를 계획의 `requiredReviews`에 포함하고 `workflow_dispatch`의 `role: "review"`·`reviewKey`로 실행한다. 같은 최신 트레일을 이미 독립 검수했다면 그 결과를 재사용한다.
+
+아래는 관리 모드 밖에서 메인이 사용하는 호출 예시다.
 
 ```text
 subagent({ command: "subagent run reviewer --isolated -- <logfile 경로>의 결정 로그를 읽고, 근거가 약한 결정·증거 없이 완료 주장된 검증·사후에 위험해 보이는 선택·사용자가 놓칠 공백을 찾아줘. 작업 재수행이 아니라 트레일 스캔이다." })
@@ -75,4 +77,4 @@ subagent({ command: "subagent run reviewer --isolated -- <logfile 경로>의 결
 ## 다른 스킬과의 연결
 
 - `pickle`·`dynamic-workflow`의 장기 실행은 이 스킬의 포맷을 그대로 쓴다. 컬럼을 재정의하지 않는다.
-- 검증 증거 기준은 `prove-it-works` 스킬을 따른다. 자기 보고는 evidence가 아니다.
+- 검증 증거 기준은 `prove-it-works` 스킬을 따른다. 자기 보고는 evidence가 아니다. 단독 로그 요청은 로그·트레일 검수 결과를 반환하고 종료하며 작업 구현이나 전달을 자동 시작하지 않는다.
