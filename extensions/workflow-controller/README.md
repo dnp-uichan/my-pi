@@ -9,7 +9,7 @@ Pi 메인이 조사·인터뷰·판단·분담을 맡고, 이 확장은 기존 �
 Stacked PR은 각 PR의 결과·제외 범위·부모 관계·검토 순서·검증과 전체 통합 완료 기준까지 처음에 합의한다. 실행 중 조정 권한은 기존 `replanPolicy`·`allowedPaths`의 실제 제한 안에서 정한다. 같은 스택의 PR마다 사용자 리뷰나 재승인을 기다리지 않는다. 합의 범위·한도 안의 실패와 보완은 메인이 처리하되, 새 목표·권한·검증 기준 완화·해결할 수 없는 인증/환경 문제와 사용자 중단은 우회하지 않는다. PR 종료 계획은 실제 전달 확인 뒤 PR 링크·검토 순서·주요 변경·검증 결과·제외/후속 범위로 인계하며, 로컬 구현이나 테스트 통과만으로 끝내지 않는다.
 
 - 메인이 `workflow_start({ goal: "목표" })`로 읽기 전용 조사와 인터뷰를 시작한다. 사용자가 `/workflow start <목표>`로 직접 시작할 수도 있다. 두 진입점은 같은 진행 안내를 받는다. 도구 응답의 `guidance`는 일회성 안내이며 정본에 저장하거나 별도 모델 턴을 만들지 않는다.
-- `workflow_propose`의 실제 UI에서 `승인`을 선택하거나 `/workflow approve`로 승인한다. 모델의 텍스트·도구 인자는 승인이 아니다. `endpoint: "pr"`일 때만 선택 필드 `prBase`를 지정할 수 있으며 생략하면 `stage`다. stacked PR이면 보호 브랜치(`main`, `master`, `stage`, `development`, `production`)가 아닌 기존 원격 브랜치를 지정한다. 승인 화면에 base가 표시된다.
+- `workflow_propose`의 실제 UI에서 `승인`을 선택하거나 `/workflow approve`로 승인한다. `/workflow approve`는 단일·스택 계획 승인을 저장한 뒤 메인의 다음 턴을 바로 요청한다. 메인이 실행 중이면 현재 실행이 끝난 뒤 이어가도록 예약하므로 별도 진행 지시가 필요 없다. 수동 압축 중이면 SDK의 idle 경계까지 요청을 보존하고, 압축 성공·실패·취소 뒤에도 승인 당시 소유 세대·계획 버전·제어 상태가 유효할 때만 한 번 전달한다. 대기 중 pause·cancel·사용자 보류·세션 변경은 실행보다 우선한다. UI·자동 승인은 진행 중인 도구 턴에서 이어가며 중복 턴을 요청하지 않는다. 중단·보류·중복 승인이나 승인 실패에는 실행 요청을 추가하지 않는다. 모델의 텍스트·도구 인자는 승인이 아니다. `endpoint: "pr"`일 때만 선택 필드 `prBase`를 지정할 수 있으며 생략하면 `stage`다. stacked PR이면 보호 브랜치(`main`, `master`, `stage`, `development`, `production`)가 아닌 기존 원격 브랜치를 지정한다. 승인 화면에 base가 표시된다.
 - `/workflow start --auto <목표>`로 시작하면 제안된 계획(재제안 포함)을 사용자 확인 없이 `via: "auto"`로 승인하고 계획의 종료 지점까지 이어간다. 미결정 정책을 임의로 정하는 옵션은 아니며 필요한 인터뷰는 유지한다. 명시적 변경 인수가 없는 전달 계획의 clean 조건·보호 브랜치 제한 등은 그대로 검사한다. 제안 사전 검사가 실패하면 기존 계획과 증거를 보존하고 차단 이유를 알리며, 승인 직전 상태가 달라져도 승인을 거절한다. 플래그는 사용자 명령에서만 켤 수 있다.
 - `workflow_dispatch` → `workflow_check` → 독립 review 순서로 진행한다. 구현 완료 주장은 검사 증거가 아니다.
 - 모델은 agent 설정을 따르고, effort는 메인이 dispatch마다 `thinking`(`low`·`medium`·`high`·`xhigh`)으로 정할 수 있다. 생략하면 agent 기본값이며 선택한 값은 attempt에 기록된다. subagent 관리 API의 `thinking` 기능이 없으면 시작하지 않는다.
@@ -34,7 +34,7 @@ bun run typecheck
 bunx --no-install biome check --error-on-warnings workflow-controller
 ```
 
-테스트는 실제 임시 Git 저장소·로컬 bare remote·실제 Pi 이벤트 버스와 subagent 관리 계약의 fake 응답자, PATH의 fake gh 실행 파일을 사용한다. 실제 subagent 구현·GitHub·사용자 설정을 변경하지 않는다.
+테스트는 실제 임시 Git 저장소·로컬 bare remote·실제 Pi 이벤트 버스와 subagent 관리 계약의 fake 응답자, PATH의 fake gh 실행 파일을 사용한다. 승인 후 자동 실행은 격리된 실제 SDK 세션과 faux provider로 idle 실행·busy 후속 턴 예약, 수동 압축의 성공·실패·취소와 대기 중 중단·세션 변경을 확인한다. 실제 subagent 구현·GitHub·사용자 설정을 변경하지 않는다.
 
 ## 사전 검사와 기존 미커밋 변경 인수
 

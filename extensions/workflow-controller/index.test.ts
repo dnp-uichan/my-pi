@@ -1,10 +1,18 @@
+import { readFileSync, watch } from "node:fs";
+import { fauxAssistantMessage, fauxProvider, InMemoryCredentialStore } from "@earendil-works/pi-ai";
 import { execFileSync } from "node:child_process";
 import { mkdtemp, mkdir, readFile, writeFile, rm, chmod } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
 	createEventBus,
+	createAgentSession,
+	DefaultResourceLoader,
+	ModelRuntime,
+	SessionManager,
+	SettingsManager,
 	type ExtensionAPI,
+	type ExtensionCommandContext,
 	type ExtensionToolContext,
 	type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
@@ -47,6 +55,8 @@ async function harness(managed = true, shared?: { root: string; refs: any[] }, o
 	let active: string[] = ["bash", "subagent"];
 	const refs: any[] = shared?.refs ?? [];
 	const messages: string[] = [];
+	const userMessages: string[] = [];
+	let messageSink: ExtensionAPI["sendUserMessage"] | undefined;
 	const prompts: string[] = [];
 	const cancellations: any[] = [];
 	const claims: any[] = [];
@@ -103,7 +113,7 @@ async function harness(managed = true, shared?: { root: string; refs: any[] }, o
 			events.emit("subagent:managed:v1:event", event);
 			return { isError: false, content: [], details: {} };
 		},
-	} as unknown as ExtensionToolContext;
+	} as unknown as ExtensionToolContext & Pick<ExtensionCommandContext, "waitForIdle">;
 	if (managed)
 		events.on("subagent:managed:v1:request", (raw: any) => {
 			if (raw.type === "capabilities")
@@ -135,7 +145,11 @@ async function harness(managed = true, shared?: { root: string; refs: any[] }, o
 			active = names;
 		},
 		appendEntry: (customType: string, data: any) => refs.push({ type: "custom", customType, data }),
-		sendUserMessage: (message: string) => messages.push(message),
+		sendUserMessage: (message: string, options?: Parameters<ExtensionAPI["sendUserMessage"]>[1]) => {
+			messages.push(message);
+			userMessages.push(message);
+			messageSink?.(message, options);
+		},
 	} as unknown as ExtensionAPI;
 	createWorkflowController({
 		agentDir: join(root, "agent"),
@@ -195,6 +209,10 @@ async function harness(managed = true, shared?: { root: string; refs: any[] }, o
 		events,
 		tools,
 		messages,
+		userMessages,
+		forwardUserMessages: (sink: ExtensionAPI["sendUserMessage"]) => {
+			messageSink = sink;
+		},
 		prompts,
 		claims,
 		started,
@@ -3167,4 +3185,382 @@ it("clean 재계획 이후에도 단위 허용 경로 밖 파일을 검사에 �
 	/* [Then] */ expect(result.isError).toBe(true);
 	expect((await h.state()).spec.adoptChanges).toBeUndefined();
 	expect((await h.state()).verification).toBeUndefined();
+});
+
+describe("승인 명령의 자동 실행", () => {
+	it.each([
+		["single", false],
+		["single", true],
+		["stack", false],
+		["stack", true],
+	] as const)("%s 명령 승인 뒤 SDK가 후속 턴을 실행한다 (busy=%s)", async (mode, busy) => {
+		/* [Given] */
+		const h = mode === "stack" ? await stackHarness(1, false) : await harness();
+		if (mode === "single") await h.start();
+		const agentDir = join(h.root, "sdk-agent");
+		const settingsManager = SettingsManager.inMemory({ compaction: { enabled: false }, retry: { enabled: false } });
+		const resourceLoader = new DefaultResourceLoader({
+			cwd: h.repo,
+			agentDir,
+			settingsManager,
+			noExtensions: true,
+			noSkills: true,
+			noPromptTemplates: true,
+			noThemes: true,
+			noContextFiles: true,
+		});
+		await resourceLoader.reload();
+		const faux = fauxProvider();
+		const modelRuntime = await ModelRuntime.create({
+			credentials: new InMemoryCredentialStore(),
+			modelsPath: null,
+			refreshOnCreate: false,
+		});
+		modelRuntime.registerNativeProvider(faux.provider);
+		await modelRuntime.setRuntimeApiKey(faux.provider.id, "test-only");
+		const { session } = await createAgentSession({
+			cwd: h.repo,
+			agentDir,
+			settingsManager,
+			resourceLoader,
+			modelRuntime,
+			model: faux.getModel(),
+			sessionManager: SessionManager.inMemory(h.repo),
+			tools: [],
+		});
+		h.ctx.isIdle = () => session.isIdle;
+		h.ctx.waitForIdle = () => session.waitForIdle();
+		Object.defineProperty(h.ctx, "signal", { get: () => session.agent.signal });
+		let enter!: () => void;
+		let release!: () => void;
+		const entered = new Promise<void>((resolve) => {
+			enter = resolve;
+		});
+		const released = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		if (busy)
+			faux.appendResponses([
+				async () => {
+					enter();
+					await released;
+					return fauxAssistantMessage("진행 중인 응답 완료");
+				},
+			]);
+		faux.appendResponses([fauxAssistantMessage("승인된 작업 실행 시작")]);
+		const pending: Promise<void>[] = [];
+		const approvals: any[] = [];
+		h.forwardUserMessages((message, options) => {
+			approvals.push(JSON.parse(readFileSync(storedPath(h), "utf8")));
+			const sending = session.sendUserMessage(message, options);
+			pending.push(sending);
+			void sending.catch(() => {});
+		});
+		const active = busy ? session.prompt("진행 중인 별도 요청") : Promise.resolve();
+		void active.catch(() => {});
+		try {
+			if (busy) await entered;
+			/* [When] */ await h.command("approve");
+			/* [Then] */
+			await expect.poll(() => (busy ? session.getFollowUpMessages().length : faux.state.callCount)).toBe(1);
+			expect(approvals).toHaveLength(1);
+			expect(approvals[0].phase).toBe("executing");
+			expect(approvals[0].approval.via).toBe("command");
+			if (mode === "stack") expect(approvals[0].stack.stage).toBe("preparing");
+			release();
+			await Promise.all([active, ...pending]);
+			await session.waitForIdle();
+			expect(faux.state.callCount).toBe(busy ? 2 : 1);
+			expect(session.messages.at(-1)).toMatchObject({
+				role: "assistant",
+				content: [{ type: "text", text: "승인된 작업 실행 시작" }],
+			});
+			expect(session.getFollowUpMessages()).toHaveLength(0);
+		} finally {
+			release();
+			await Promise.allSettled([active, ...pending]);
+			await session.abort();
+			session.dispose();
+		}
+	});
+	it.each(["single", "stack"] as const)("%s의 중복 승인 명령은 턴을 추가하지 않는다", async (mode) => {
+		/* [Given] */ const h = mode === "stack" ? await stackHarness(1, false) : await harness();
+		if (mode === "single") await h.start();
+		const before = h.userMessages.length;
+		/* [When] */ await Promise.all([h.command("approve"), h.command("approve")]);
+		/* [Then] */ expect(h.userMessages).toHaveLength(before + 1);
+	});
+	it.each(["single", "stack"] as const)("%s의 중단·보류·실패 승인은 턴을 시작하지 않는다", async (mode) => {
+		/* [Given] */ const h = mode === "stack" ? await stackHarness(1, false) : await harness();
+		if (mode === "single") await h.start({ ...spec, endpoint: "commit" });
+		const before = h.userMessages.length;
+		await writeFile(join(h.repo, "file.txt"), "승인 불가능한 변경\n");
+		/* [When] */
+		await h.command("approve");
+		await h.command("pause");
+		await h.command("approve");
+		await h.command("resume");
+		const resumed = h.userMessages.length;
+		await h.call("block", { reason: "사용자 판단 대기" });
+		await h.command("approve");
+		await h.command("cancel");
+		await h.command("approve");
+		/* [Then] */
+		expect(resumed).toBe(before + 1);
+		expect(h.userMessages).toHaveLength(resumed);
+		expect((await h.state()).approval).toBeUndefined();
+	});
+	it.each(["single", "stack"] as const)("%s의 승인 저장 실패는 턴을 시작하지 않는다", async (mode) => {
+		/* [Given] */ const h = mode === "stack" ? await stackHarness(1, false) : await harness();
+		if (mode === "single") await h.start();
+		const before = h.userMessages.length;
+		const path = storedPath(h);
+		await rm(path);
+		await mkdir(path);
+		/* [When] */ await h.command("approve");
+		/* [Then] */ expect(h.userMessages).toHaveLength(before);
+		expect((await h.state()).error).toMatch(/저장 오류/);
+	});
+	it.each(["single", "stack"] as const)("%s의 자동 승인은 현재 턴에 중복 요청을 넣지 않는다", async (mode) => {
+		/* [Given] */ const h = await harness();
+		if (mode === "stack") await fakeRemote(h);
+		await h.command(`start ${mode === "stack" ? "--stack " : ""}--auto 목표`);
+		const before = h.userMessages.length;
+		/* [When] */ await h.call(mode === "stack" ? "stack_propose" : "propose", mode === "stack" ? stackPlan(1) : spec);
+		/* [Then] */ expect((await h.state()).approval.via).toBe("auto");
+		expect(h.userMessages).toHaveLength(before);
+	});
+});
+
+describe("승인 중 사용자 중단", () => {
+	it.each(["pause", "cancel", "block"] as const)("스택 승인 검사 중 %s는 후속 실행보다 우선한다", async (action) => {
+		/* [Given] */ const h = await stackHarness(1, false);
+		const bin = join(h.root, "bin");
+		const entered = join(h.root, "approval-entered");
+		const release = join(h.root, "approval-release");
+		const realGit = execFileSync("which", ["git"], { encoding: "utf8" }).trim();
+		await writeFile(
+			join(bin, "git"),
+			`#!/usr/bin/env node
+const fs = require('node:fs');
+const { spawnSync } = require('node:child_process');
+(async () => {
+  if (process.argv[2] === 'ls-remote') {
+    fs.writeFileSync(${JSON.stringify(entered)}, 'entered');
+    while (!fs.existsSync(${JSON.stringify(release)})) await new Promise(resolve => setTimeout(resolve, 5));
+  }
+  const result = spawnSync(${JSON.stringify(realGit)}, process.argv.slice(2), { stdio: 'inherit' });
+  process.exit(result.status ?? 1);
+})();
+`,
+		);
+		await chmod(join(bin, "git"), 0o755);
+		const before = h.userMessages.length;
+		const path = process.env.PATH;
+		process.env.PATH = `${bin}:${path}`;
+		let enteredApproval!: () => void;
+		const waiting = new Promise<void>((resolve) => {
+			enteredApproval = resolve;
+		});
+		const watcher = watch(h.root, (_event, file) => {
+			if (file === "approval-entered") enteredApproval();
+		});
+		const approval = h.command("approve");
+		try {
+			await waiting;
+			/* [When] */
+			if (action === "block") await h.call("block", { reason: "사용자 판단 대기" });
+			else await h.command(action);
+		} finally {
+			watcher.close();
+			await writeFile(release, "release");
+			await approval;
+			process.env.PATH = path;
+		}
+		/* [Then] */ expect(h.userMessages).toHaveLength(before);
+		expect((await h.state()).control).toBe(
+			action === "pause" ? "paused" : action === "cancel" ? "cancelled" : "blocked",
+		);
+		expect((await h.state()).stack.approval).toBeUndefined();
+	});
+	it.each([
+		["single", "승인"],
+		["single", "보류"],
+		["stack", "승인"],
+		["stack", "보류"],
+	] as const)("%s의 UI %s는 현재 턴에 후속 실행을 중복 예약하지 않는다", async (mode, choice) => {
+		/* [Given] */ const h = mode === "stack" ? await stackHarness(1, false) : await harness();
+		if (mode === "single") await h.command("start 목표");
+		h.select(choice);
+		const before = h.userMessages.length;
+		/* [When] */ await h.call(mode === "stack" ? "stack_propose" : "propose", mode === "stack" ? stackPlan(1) : spec);
+		/* [Then] */ expect(h.userMessages).toHaveLength(before);
+		expect((await h.state()).approval?.via).toBe(choice === "승인" ? "ui" : undefined);
+	});
+});
+
+async function compactingSDK(h: Awaited<ReturnType<typeof harness>>, outcome: "success" | "failure" | "abort") {
+	const agentDir = join(h.root, "compacting-sdk");
+	const settingsManager = SettingsManager.inMemory({
+		compaction: { enabled: false, keepRecentTokens: 1 },
+		retry: { enabled: false },
+	});
+	let enter!: () => void;
+	let release!: () => void;
+	const entered = new Promise<void>((resolve) => {
+		enter = resolve;
+	});
+	const released = new Promise<void>((resolve) => {
+		release = resolve;
+	});
+	const resourceLoader = new DefaultResourceLoader({
+		cwd: h.repo,
+		agentDir,
+		settingsManager,
+		noExtensions: true,
+		noSkills: true,
+		noPromptTemplates: true,
+		noThemes: true,
+		noContextFiles: true,
+		extensionFactories: [
+			(pi) => {
+				pi.registerCommand("workflow-approve-fixture", {
+					description: "실제 압축 중 workflow 승인",
+					handler: async () => h.command("approve"),
+				});
+				pi.on("session_before_compact", async (event) => {
+					enter();
+					await released;
+					if (outcome === "failure") return;
+					return {
+						compaction: {
+							summary: "이전 대화 압축",
+							firstKeptEntryId: event.preparation.firstKeptEntryId,
+							tokensBefore: event.preparation.tokensBefore,
+						},
+					};
+				});
+			},
+		],
+	});
+	await resourceLoader.reload();
+	const faux = fauxProvider();
+	if (outcome === "failure")
+		faux.appendResponses([fauxAssistantMessage("", { stopReason: "error", errorMessage: "압축 실패 fixture" })]);
+	faux.appendResponses([fauxAssistantMessage("압축 종료 후 승인된 작업 실행")]);
+	const modelRuntime = await ModelRuntime.create({
+		credentials: new InMemoryCredentialStore(),
+		modelsPath: null,
+		refreshOnCreate: false,
+	});
+	modelRuntime.registerNativeProvider(faux.provider);
+	await modelRuntime.setRuntimeApiKey(faux.provider.id, "test-only");
+	const sessionManager = SessionManager.inMemory(h.repo);
+	sessionManager.appendMessage({ role: "user", content: "압축할 이전 요청", timestamp: Date.now() });
+	sessionManager.appendMessage(fauxAssistantMessage("압축할 이전 응답"));
+	sessionManager.appendMessage({ role: "user", content: "보존할 최근 요청", timestamp: Date.now() });
+	sessionManager.appendMessage(fauxAssistantMessage("보존할 최근 응답"));
+	const { session } = await createAgentSession({
+		cwd: h.repo,
+		agentDir,
+		settingsManager,
+		resourceLoader,
+		modelRuntime,
+		model: faux.getModel(),
+		sessionManager,
+		tools: [],
+	});
+	h.ctx.isIdle = () => session.isIdle;
+	h.ctx.waitForIdle = () => session.waitForIdle();
+	Object.defineProperty(h.ctx, "signal", { get: () => session.agent.signal });
+	const sending: Promise<void>[] = [];
+	h.forwardUserMessages((message, options) => {
+		const job = session.sendUserMessage(message, options);
+		sending.push(job);
+		void job.catch(() => {});
+	});
+	const compacting = session.compact();
+	const settledCompaction = Promise.allSettled([compacting]);
+	await entered;
+	const finish = async () => {
+		if (outcome === "abort") session.abortCompaction();
+		release();
+		return (await settledCompaction)[0];
+	};
+	const cleanup = async () => {
+		release();
+		await settledCompaction;
+		await Promise.allSettled(sending);
+		await session.abort();
+		session.dispose();
+	};
+	return { session, faux, sending, finish, cleanup };
+}
+
+describe("압축 중 승인 실행 요청 보존", () => {
+	it.each([
+		["single", "success"],
+		["single", "failure"],
+		["single", "abort"],
+		["stack", "success"],
+		["stack", "failure"],
+		["stack", "abort"],
+	] as const)("%s 승인은 압축 %s 종료 후 한 번 실행한다", async (mode, outcome) => {
+		/* [Given] */ const h = mode === "stack" ? await stackHarness(1, false) : await harness();
+		if (mode === "single") await h.start();
+		const sdk = await compactingSDK(h, outcome);
+		const before = h.userMessages.length;
+		try {
+			/* [When] */ await sdk.session.prompt("/workflow-approve-fixture");
+			/* [Then] */
+			expect((await h.state()).approval.via).toBe("command");
+			expect(h.userMessages).toHaveLength(before);
+			expect(sdk.sending).toHaveLength(0);
+			const compacted = await sdk.finish();
+			expect(compacted.status).toBe(outcome === "success" ? "fulfilled" : "rejected");
+			await expect.poll(() => sdk.faux.state.callCount).toBe(outcome === "failure" ? 2 : 1);
+			await Promise.all(sdk.sending);
+			await sdk.session.waitForIdle();
+			expect(h.userMessages).toHaveLength(before + 1);
+			expect(sdk.session.messages.at(-1)).toMatchObject({
+				role: "assistant",
+				content: [{ type: "text", text: "압축 종료 후 승인된 작업 실행" }],
+			});
+		} finally {
+			await sdk.cleanup();
+		}
+	});
+	it.each([
+		["single", "pause"],
+		["single", "cancel"],
+		["single", "hold"],
+		["single", "shutdown"],
+		["single", "switch"],
+		["stack", "pause"],
+		["stack", "cancel"],
+		["stack", "hold"],
+		["stack", "shutdown"],
+		["stack", "switch"],
+	] as const)("%s 승인 대기 중 %s는 압축 후 실행을 막는다", async (mode, action) => {
+		/* [Given] */ const h = mode === "stack" ? await stackHarness(1, false) : await harness();
+		if (mode === "single") await h.start();
+		const sdk = await compactingSDK(h, "success");
+		const before = h.userMessages.length;
+		await sdk.session.prompt("/workflow-approve-fixture");
+		try {
+			/* [When] */
+			if (action === "pause" || action === "cancel") await h.command(action);
+			else if (action === "hold") await h.call("block", { reason: "사용자 판단 대기" });
+			else if (action === "shutdown") await h.hook("session_shutdown", { type: "session_shutdown" });
+			else await h.hook("session_start", { type: "session_start", reason: "switch" });
+			/* [Then] */
+			await sdk.finish();
+			await h.state();
+			expect(h.userMessages).toHaveLength(before);
+			expect(sdk.sending).toHaveLength(0);
+			expect(sdk.faux.state.callCount).toBe(0);
+		} finally {
+			await sdk.cleanup();
+		}
+	});
 });

@@ -30,6 +30,7 @@ import { randomUUID } from "node:crypto";
 import type {
 	AgentBeforeSettleEvent,
 	ExtensionAPI,
+	ExtensionCommandContext,
 	ExtensionContext,
 	ExtensionToolContext,
 } from "@earendil-works/pi-coding-agent";
@@ -283,11 +284,11 @@ export class WorkflowController {
 				throw new Error("아직 종료하지 않은 관리 작업이 있습니다.");
 		}
 	}
-	async command(args: string, ctx: ExtensionContext): Promise<void> {
+	async command(args: string, ctx: ExtensionCommandContext): Promise<void> {
 		this.context = ctx;
 		try {
 			if (args.trim() === "approve" && this.state?.mode === "stack") {
-				await this.approveStack("command");
+				await this.approveStack("command", undefined, ctx);
 				return;
 			}
 			if (args.trim() === "resume") {
@@ -314,7 +315,7 @@ export class WorkflowController {
 						ctx.ui.notify(JSON.stringify(this.status(), null, 2), "info");
 						break;
 					case "approve":
-						await this.approve("command");
+						await this.approve("command", undefined, ctx);
 						break;
 					case "pause":
 						await this.stop("paused");
@@ -589,7 +590,11 @@ export class WorkflowController {
 			}
 		});
 	}
-	private async approveStack(via: "ui" | "command" | "auto", expectedVersion?: string): Promise<void> {
+	private async approveStack(
+		via: "ui" | "command" | "auto",
+		expectedVersion?: string,
+		commandContext?: ExtensionCommandContext,
+	): Promise<void> {
 		const { state, observed } = await this.serial(async () => {
 			const state = this.running();
 			if (state.phase !== "awaiting-approval" || !state.stack || state.stack.approval || this.delivering)
@@ -601,6 +606,7 @@ export class WorkflowController {
 			this.delivering = true;
 			return { state, observed: structuredClone(state) };
 		});
+		let approved = false;
 		try {
 			const plan = observed.stack?.plan;
 			if (!plan) throw new Error("스택 계획이 없습니다.");
@@ -627,6 +633,7 @@ export class WorkflowController {
 				};
 				activateStackUnit(state, this.at());
 				await this.persist("stack approved");
+				approved = true;
 			});
 		} finally {
 			await this.serial(async () => {
@@ -635,12 +642,25 @@ export class WorkflowController {
 					await this.settleStop();
 					await this.persist("stack approval stopped");
 				}
+				if (
+					approved &&
+					via === "command" &&
+					commandContext &&
+					this.state === state &&
+					this.owned() &&
+					!this.fatal &&
+					state.control === "running" &&
+					!state.userHold &&
+					state.controlRevision === observed.controlRevision
+				)
+					this.wakeApproved(state, commandContext);
 			});
 		}
 	}
 	private async approve(
 		via: "ui" | "command" | "auto",
 		displayed?: { version: string; workspace: WorkspaceEvidence },
+		commandContext?: ExtensionCommandContext,
 	): Promise<void> {
 		const state = this.running();
 		if (state.phase !== "awaiting-approval" || !state.spec || !state.planVersion)
@@ -658,6 +678,40 @@ export class WorkflowController {
 		state.approval = this.approvalRecord(state.spec, state.planVersion, current, via);
 		state.phase = "executing";
 		await this.persist("approve");
+		if (via === "command" && commandContext) this.wakeApproved(state, commandContext);
+	}
+	private wakeApproved(state: Workflow, ctx: ExtensionCommandContext): void {
+		const owner = ownerOf(state);
+		const revision = state.controlRevision;
+		const version = state.planVersion;
+		const sessionId = ctx.sessionManager.getSessionId();
+		const send = () => {
+			if (
+				this.state !== state ||
+				!this.owned() ||
+				this.fatal ||
+				terminal(state) ||
+				state.control !== "running" ||
+				state.userHold ||
+				state.controlRevision !== revision ||
+				state.planVersion !== version ||
+				!sameOwner(ownerOf(state), owner) ||
+				this.context?.sessionManager.getSessionId() !== sessionId
+			)
+				return;
+			this.pi.sendUserMessage(
+				stackInstruction(state) ??
+					"워크플로 계획이 승인되었습니다. workflow_status로 승인 범위를 확인하고 workflow_dispatch로 구현·독립 검수, workflow_check로 검증을 진행하세요. 추가 진행 지시를 기다리지 말고 승인된 종료 지점까지만 실행하세요. 직접 commit·push·PR·merge·배포 금지.",
+				{ deliverAs: "followUp" },
+			);
+		};
+		/* 수동 압축은 활성 agent signal 없이 busy다. 성공·실패·취소 모두 SDK idle 경계 뒤에만 prompt를 받는다. */
+		if (!ctx.isIdle() && !ctx.signal)
+			void ctx
+				.waitForIdle()
+				.then(() => this.serial(async () => send()))
+				.catch((error) => this.notify(String(error)));
+		else send();
 	}
 	private approvalRecord(
 		spec: Spec,
