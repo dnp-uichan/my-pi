@@ -9,6 +9,7 @@ import { Type, type TSchema } from "typebox";
 import { Value } from "typebox/value";
 import { WorkflowController } from "./controller.ts";
 import { specSchema, type Options } from "./model.ts";
+import { errorContent, statusQuerySchema, toolContent } from "./output.ts";
 
 export function createWorkflowController(options: Options) {
 	return (pi: ExtensionAPI): void => {
@@ -36,17 +37,18 @@ export function createWorkflowController(options: Options) {
 				execute: async (_toolCallId, params, signal, _onUpdate, ctx) => {
 					try {
 						if (!Value.Check(parameters, params)) throw new Error("잘못된 workflow 도구 입력입니다.");
-						const details = await (serial
+						const result = await (serial
 							? controller.serial(() => action(params, ctx, signal))
 							: action(params, ctx, signal));
+						const details = result ?? controller.status();
 						return {
-							content: [{ type: "text", text: JSON.stringify(details ?? controller.status(), null, 2) }],
-							details: details ?? controller.status(),
+							content: [{ type: "text", text: await toolContent(name, details, options, params) }],
+							details,
 						};
 					} catch (error) {
 						return {
 							isError: true,
-							content: [{ type: "text", text: String(error) }],
+							content: [{ type: "text", text: await errorContent(String(error), controller.status(), options) }],
 							details: { error: String(error) },
 						};
 					}
@@ -81,7 +83,12 @@ export function createWorkflowController(options: Options) {
 			async (_params, ctx, signal) => controller.resumeFromTool(ctx, signal),
 			false,
 		);
-		tool("status", "워크플로 정본 상태·증거를 조회한다.", Type.Object({}), async () => controller.status());
+		tool(
+			"status",
+			"현재 단계·차단·승인·실행 ID와 정본 경로를 간결하게 조회한다. 상세는 section(spec/approval/attempts/checks/deliveries/events/stack), index(배열 항목), offset, limit(기본 2000·최대 4000자)으로 명시적 JSON 문자 페이지를 조회한다. 전체 상태를 기본 반환하지 않는다.",
+			statusQuerySchema,
+			async () => controller.status(),
+		);
 		tool(
 			"preflight",
 			"상태를 바꾸지 않고 후보 계획의 승인 가능성·변경 인수 대상을 조회한다.",

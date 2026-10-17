@@ -18,6 +18,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { afterEach, describe, expect, it } from "vitest";
 import { createWorkflowController } from "./index.ts";
+import { errorContent } from "./output.ts";
 import { planVersion, type Options } from "./model.ts";
 
 const roots: string[] = [];
@@ -803,6 +804,289 @@ describe("fatal 이후 소유 실행 중단", () => {
 			expect((await h.state()).error).toMatch(/저장 오류/);
 		},
 	);
+});
+
+function responseText(result: Awaited<ReturnType<ToolDefinition["execute"]>>): string {
+	const content = result.content[0];
+	if (content?.type !== "text") throw new Error("텍스트 응답이 필요합니다.");
+	return content.text;
+}
+
+describe("워크플로 도구 출력", () => {
+	it("증거를 저장할 수 없어도 원래 긴 오류를 반환한다", async () => {
+		/* [Given] 증거 디렉터리 대신 파일이 있고 긴 원래 오류가 있다. */
+		const h = await harness();
+		const unavailable = join(h.root, "not-a-directory");
+		await writeFile(unavailable, "blocked");
+		const original = `원래 작업 실패: ${"원인".repeat(1000)}`;
+		/* [When] 오류 응답을 직렬화한다. */
+		const text = await errorContent(original, { error: "상태 없음" }, { agentDir: unavailable });
+		/* [Then] 저장 장애가 원래 오류를 덮지 않고 제한된 본문으로 반환된다. */
+		const result = JSON.parse(text);
+		expect(result.ok).toBe(false);
+		expect(result.error).toContain("원래 작업 실패:");
+		expect(result.errorEvidence.error).toContain("ENOTDIR");
+		expect(text.length).toBeLessThan(3000);
+	});
+	it("잘린 시작 안내도 별도 원문에서 끝까지 읽을 수 있다", async () => {
+		/* [Given] 목표가 길어 시작 안내에 요약이 필요하다. */
+		const h = await harness();
+		/* [When] 도구로 작업 초안을 시작한다. */
+		const result = await h.call("start", { goal: "긴 작업 목표 ".repeat(1000) });
+		/* [Then] 마지막 승인 지침을 포함한 원문이 접근 가능한 파일에 남는다. */
+		const summary = JSON.parse(responseText(result));
+		const details = result.details;
+		if (!details || typeof details !== "object" || !("guidance" in details) || typeof details.guidance !== "string")
+			throw new Error("시작 안내 원문이 필요합니다.");
+		expect(details.guidance.length).toBeGreaterThan(4000);
+		expect(JSON.parse(await readFile(summary.guidanceEvidence.path, "utf8")).guidance).toBe(details.guidance);
+		expect(responseText(result).length).toBeLessThan(12_000);
+	});
+	it("완료된 네 PR의 HEAD와 URL을 모두 인계한다", async () => {
+		/* [Given] 네 단위 PR 전달과 최종 통합 검수가 끝났다. */
+		const h = await stackHarness(4);
+		for (let index = 0; index < 4; index++) await h.completeUnit();
+		await h.call("check");
+		await h.fake.withGh(async () => {
+			await h.review("integration");
+			await expect
+				.poll(
+					async () => {
+						const current = await h.state();
+						return { phase: current.phase, control: current.control, reason: current.reason };
+					},
+					{ timeout: 5000 },
+				)
+				.toMatchObject({ phase: "completed", control: "running" });
+		});
+		const state = await h.state();
+		/* [When] 완료 상태의 기본 응답을 조회한다. */
+		const result = await h.call("status");
+		/* [Then] 오래된 PR도 전달 식별자를 잃지 않는다. */
+		expect(state.phase).toBe("completed");
+		for (const delivery of state.stack.results) {
+			expect(responseText(result)).toContain(delivery.head);
+			expect(responseText(result)).toContain(delivery.url);
+		}
+	}, 60_000);
+	it("검사 실패 응답 자체에 실패 원인과 원본 에러 계약을 남긴다", async () => {
+		/* [Given] 승인된 검사에서 구체적인 오류가 발생한다. */
+		const h = await harness();
+		await h.approve({ ...spec, checks: ["printf '서명 검증 오류' >&2; exit 9"] });
+		/* [When] 검사를 실행한다. */
+		const result = await h.call("check");
+		/* [Then] 별도 상태 조회 없이 실패를 알 수 있고 details의 에러는 유지된다. */
+		const summary = JSON.parse(responseText(result));
+		expect(result.isError).toBe(true);
+		expect(summary).toMatchObject({ ok: false, phase: "executing" });
+		expect(summary.checks.failed.items[0]).toMatchObject({ exitCode: 9, stderr: "서명 검증 오류" });
+		expect(result.details).toEqual({ error: summary.error });
+	});
+	it("실패한 구현은 복구 대상 ID와 실패 이유를 반환한다", async () => {
+		/* [Given] 구현 worker가 오류로 종료되었다. */
+		const h = await harness();
+		await h.approve();
+		await h.call("dispatch", { role: "implement", task: "구현" });
+		await h.finish(undefined, {
+			status: "failed",
+			exitCode: 4,
+			finalOutput: "의존성 설치 실패",
+			stopReason: "환경 오류",
+		});
+		/* [When] 현재 상태를 조회한다. */
+		const result = await h.call("status");
+		/* [Then] 실패한 실행을 식별하고 실제 작업 공간 복구를 먼저 안내한다. */
+		const summary = JSON.parse(responseText(result));
+		expect(summary.attempts.attention.items[0]).toMatchObject({
+			id: h.started[0].attemptId,
+			status: "failed",
+			stopReason: "환경 오류",
+			output: "의존성 설치 실패",
+		});
+		expect(summary.nextAction).toContain("workflow_recover");
+	});
+	it("완료된 전달의 커밋 HEAD를 기본 본문으로 인계한다", async () => {
+		/* [Given] 독립 검수를 통과하고 전달 worker가 커밋을 완료했다. */
+		const h = await harness();
+		await h.ready();
+		await h.call("dispatch", { role: "deliver", task: "커밋" });
+		git(h.repo, "add", "file.txt");
+		git(h.repo, "commit", "-m", "approved delivery");
+		await h.finish();
+		/* [When] 완료 상태를 조회한다. */
+		const result = await h.call("status");
+		/* [Then] 성공 상태뿐 아니라 전달한 커밋의 식별자도 남긴다. */
+		const summary = JSON.parse(responseText(result));
+		expect(summary.phase).toBe("completed");
+		expect(summary.deliveries.items[0]).toMatchObject({
+			action: "commit",
+			state: "done",
+			head: git(h.repo, "rev-parse", "HEAD"),
+		});
+	});
+	it("큰 preflight도 변경 개수와 원문은 보존하고 기본 본문은 제한한다", async () => {
+		/* [Given] 긴 경로를 가진 미추적 파일이 다수 있다. */
+		const h = await harness();
+		await Promise.all(
+			Array.from({ length: 100 }, (_, index) =>
+				writeFile(join(h.repo, `${index}-${"경로".repeat(25)}.txt`), "existing change"),
+			),
+		);
+		/* [When] 계획 없이 작업 공간을 조회한다. */
+		const result = await h.call("preflight");
+		/* [Then] 필요한 상태만 본문에 남기고 전체 변경 목록은 원문 경로에서 읽는다. */
+		const summary = JSON.parse(responseText(result));
+		expect(responseText(result).length).toBeLessThan(12_000);
+		expect(summary).toMatchObject({ eligible: null, changes: { total: 100 } });
+		expect(JSON.stringify(result.details).length).toBeGreaterThan(20_000);
+		expect(JSON.parse(await readFile(summary.evidence.path, "utf8"))).toEqual(result.details);
+	});
+	it("큰 실행 이력도 기본 본문은 작고 정본과 UI 증거는 보존한다", async () => {
+		/* [Given] 승인된 작업에 긴 worker 보고가 누적되어 있다. */
+		const h = await harness();
+		await h.approve();
+		const report = `원문 시작\n${"조사 근거\n".repeat(1100)}원문 끝`;
+		for (let index = 0; index < 12; index++) {
+			await h.call("dispatch", { role: "research", task: `조사 ${index} ${"범위".repeat(3000)}` });
+			await h.finish(undefined, { finalOutput: report });
+		}
+		const before = await h.state();
+		/* [When] 기본 상태를 조회한다. */
+		const result = await h.call("status");
+		/* [Then] LLM 본문만 축약하고 저장된 증거와 details는 바꾸지 않는다. */
+		const text = responseText(result);
+		const summary = JSON.parse(text);
+		expect(JSON.stringify(before).length).toBeGreaterThan(100_000);
+		expect(text.length).toBeLessThan(12_000);
+		expect(summary).toMatchObject({ workflowId: before.workflowId, phase: "executing", control: "running" });
+		expect(summary.nextAction).toMatch(/workflow_check|workflow_dispatch/);
+		expect(result.details).toEqual(before);
+		expect(JSON.parse(await readFile(summary.evidence.path, "utf8"))).toEqual(before);
+	});
+	it("dispatch와 check도 현재 결과와 식별자만 간결하게 반환한다", async () => {
+		/* [Given] 큰 작업 설명이 승인되어 있다. */
+		const h = await harness();
+		await h.approve({
+			...spec,
+			objective: "작업 설명".repeat(20_000),
+			checks: ["printf '검사 근거\\n%.0s' {1..2000}"],
+		});
+		/* [When] worker 실행 후 종료하고 검사를 수행한다. */
+		const dispatched = await h.call("dispatch", { role: "implement", task: "구현".repeat(20_000) });
+		await h.finish();
+		const checked = await h.call("check");
+		/* [Then] 실행 ID와 검사 성공은 본문에, 출력 원문은 details에 남는다. */
+		const dispatchSummary = JSON.parse(responseText(dispatched));
+		const checkSummary = JSON.parse(responseText(checked));
+		expect(responseText(dispatched).length).toBeLessThan(12_000);
+		expect(dispatchSummary.attempts.active.items[0]).toMatchObject({ id: h.started[0].attemptId, status: "running" });
+		expect(responseText(checked).length).toBeLessThan(12_000);
+		expect(checkSummary).toMatchObject({ ok: true, phase: "reviewing" });
+		expect(checkSummary.checks.recent.items[0].exitCode).toBe(0);
+		expect((checked.details as any).checks[0].stdout.length).toBeGreaterThan(4000);
+	});
+	it("승인 대기와 사용자 보류를 실행 승인으로 오인하지 않게 표시한다", async () => {
+		/* [Given] 사용자 승인을 받지 않은 계획이 있다. */
+		const h = await harness();
+		await h.start();
+		/* [When] 승인 대기를 조회한 뒤 사용자가 보류한다. */
+		const pending = await h.call("status");
+		await h.command("pause");
+		const paused = await h.call("status");
+		/* [Then] 승인 부재와 사용자만 해제 가능한 보류가 유지된다. */
+		expect(JSON.parse(responseText(pending))).toMatchObject({ phase: "awaiting-approval", approval: null });
+		expect(JSON.parse(responseText(pending)).nextAction).toMatch(/승인/);
+		expect(JSON.parse(responseText(paused))).toMatchObject({
+			control: "paused",
+			userHold: true,
+			controlSource: "user",
+		});
+		expect(JSON.parse(responseText(paused)).nextAction).toMatch(/사용자/);
+		expect((paused.details as any).approval).toBeUndefined();
+	});
+	it("실패한 검사와 검수의 구체 지적 및 차단 이유를 남긴다", async () => {
+		/* [Given] 실패한 검사 증거가 있다. */
+		const h = await harness();
+		await h.approve({ ...spec, checks: ["printf '접근 권한 누락' >&2; exit 7"] });
+		await h.call("check");
+		/* [When] 상태 조회와 차단을 요청한다. */
+		const failed = await h.call("status");
+		const blocked = await h.call("block", { reason: "접근 권한은 사용자 판단 필요" });
+		/* [Then] 실패 종료 코드와 원인, 차단 이유를 기본 본문에서 확인한다. */
+		expect(JSON.parse(responseText(failed)).checks.failed.items[0]).toMatchObject({
+			exitCode: 7,
+			stderr: "접근 권한 누락",
+		});
+		expect(JSON.parse(responseText(blocked))).toMatchObject({
+			control: "blocked",
+			reason: "접근 권한은 사용자 판단 필요",
+		});
+		expect(JSON.parse(responseText(blocked)).nextAction).toMatch(/사용자/);
+	});
+	it("검수 반려의 판정과 수정 지적을 기본 본문에 남긴다", async () => {
+		/* [Given] 현재 검사 증거를 바탕으로 독립 검수가 반려되었다. */
+		const h = await harness();
+		await h.approve();
+		await h.call("check");
+		await h.call("dispatch", { role: "review", task: "검수" });
+		await h.finish(undefined, { finalOutput: "설정 저장 시 권한 검사가 누락됨\nWORKFLOW_VERDICT: changes-requested" });
+		/* [When] 현재 상태를 조회한다. */
+		const result = await h.call("status");
+		/* [Then] 본문만 읽어도 반려와 구체적인 수정 대상을 알 수 있다. */
+		const summary = JSON.parse(responseText(result));
+		expect(summary.attempts.attention.items[0]).toMatchObject({ verdict: "changes-requested" });
+		expect(summary.attempts.attention.items[0].output).toContain("권한 검사가 누락됨");
+	});
+	it("명시적 상세 조회는 제한된 페이지로 원문 끝까지 읽는다", async () => {
+		/* [Given] 한 페이지보다 큰 worker 보고가 있다. */
+		const h = await harness();
+		await h.approve();
+		await h.call("dispatch", { role: "research", task: "조사" });
+		await h.finish(undefined, { finalOutput: `${"근거".repeat(3000)}마지막 증거` });
+		const before = await h.state();
+		/* [When] 실행 이력의 특정 항목을 페이지로 읽는다. */
+		let offset = 0;
+		let reconstructed = "";
+		do {
+			const result = await h.call("status", { section: "attempts", index: 0, offset, limit: 997 });
+			expect(result.isError).not.toBe(true);
+			const page = JSON.parse(responseText(result));
+			expect(page.data.length).toBeLessThanOrEqual(997);
+			expect(responseText(result).length).toBeLessThan(2500);
+			reconstructed += page.data;
+			offset = page.nextOffset;
+		} while (offset !== null);
+		/* [Then] 잘림 없이 원문이 복원되고 정본과 UI 계약은 그대로다. */
+		expect(JSON.parse(reconstructed)).toEqual(before.attempts[0]);
+		expect((await h.state()).attempts).toEqual(before.attempts);
+	});
+	it.each([
+		{ section: "full" },
+		{ section: "attempts", limit: 4001 },
+		{ section: "attempts", offset: -1 },
+		{ section: "attempts", index: 99 },
+		{ offset: 0 },
+	])("무제한·잘못된 상세 요청을 거절한다 (%j)", async (query) => {
+		/* [Given] 진행 중인 워크플로가 있다. */
+		const h = await harness();
+		await h.approve();
+		/* [When] 지원하지 않는 상세 범위를 요청한다. */
+		const result = await h.call("status", query);
+		/* [Then] 입력 오류이며 승인과 상태는 유지한다. */
+		expect(result.isError).toBe(true);
+		expect((await h.state()).phase).toBe("executing");
+	});
+	it("preflight의 승인 가능성과 차단 지적은 보존하고 원문 경로를 제공한다", async () => {
+		/* [Given] 승인할 수 없는 계획 후보가 있다. */
+		const h = await harness();
+		/* [When] 후보 계획의 승인 가능성을 조회한다. */
+		const result = await h.call("preflight", { spec: { ...spec, checks: ["git push origin HEAD"] } });
+		/* [Then] 실패 판정과 구체 차단 이유를 남기며 원문도 읽을 수 있다. */
+		const summary = JSON.parse(responseText(result));
+		expect(summary.eligible).toBe(false);
+		expect(summary.blockers.items.join(" ")).toMatch(/push|전달/);
+		expect(JSON.parse(await readFile(summary.evidence.path, "utf8"))).toEqual(result.details);
+	});
 });
 
 describe("인터뷰 합의 전달", () => {
